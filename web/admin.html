@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>管理控制台 · portknock</title>
+<style>
+  :root {
+    --bg0:#0b1020; --bg1:#131a35; --card:rgba(255,255,255,.055); --card-br:rgba(255,255,255,.1);
+    --fg:#eef1f8; --muted:#9aa4c4; --accent:#6d8cff; --accent2:#8b5cf6;
+    --danger:#f87171; --ok:#34d399; --amber:#fbbf24; --ring:rgba(109,140,255,.5);
+    --shadow:0 20px 60px -20px rgba(0,0,0,.6);
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; color:var(--fg); font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.6; padding:2.5rem 1.25rem 4rem; -webkit-text-size-adjust:100%;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(139,92,246,.2), transparent 60%),
+      radial-gradient(1000px 500px at 110% 0%, rgba(109,140,255,.2), transparent 55%),
+      linear-gradient(160deg, var(--bg0), var(--bg1));
+    background-attachment:fixed;
+  }
+  .wrap { max-width:880px; margin:0 auto; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; gap:.75rem; margin-bottom:1.5rem; }
+  .brand { display:flex; align-items:center; gap:.65rem; font-weight:650; font-size:1.15rem; min-width:0; }
+  .brand svg { width:28px; height:28px; flex:none; }
+  .brand .dot { color:var(--muted); font-weight:400; font-size:.95rem; }
+  .ghost {
+    background:rgba(255,255,255,.06); color:var(--fg); border:1px solid var(--card-br);
+    border-radius:10px; padding:.5rem 1rem; font-size:.9rem; cursor:pointer; transition:background .15s; white-space:nowrap;
+  }
+  .ghost:hover { background:rgba(255,255,255,.12); }
+
+  /* Stats bar (A) */
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:.9rem; margin-bottom:1.25rem; }
+  .stat {
+    background:var(--card); border:1px solid var(--card-br); border-radius:16px;
+    padding:1rem 1.1rem; backdrop-filter:blur(14px);
+  }
+  .stat .n { font-size:1.9rem; font-weight:750; line-height:1.1; font-variant-numeric:tabular-nums; }
+  .stat .l { color:var(--muted); font-size:.82rem; margin-top:.15rem; }
+  .stat.world .n { color:var(--amber); }
+  .stat.perm .n { color:var(--ok); }
+  .stat.dyn .n { color:var(--accent); }
+
+  .card {
+    background:var(--card); border:1px solid var(--card-br); border-radius:18px;
+    padding:1.5rem 1.6rem; margin-bottom:1.25rem; backdrop-filter:blur(14px); box-shadow:var(--shadow);
+  }
+  .card h2 { font-size:1.08rem; margin:0 0 .3rem; display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+  .card h2 svg { width:19px; height:19px; color:var(--accent); flex:none; }
+  .desc { color:var(--muted); font-size:.88rem; margin:0 0 1.1rem; }
+  .pill { font-size:.72rem; font-weight:600; padding:.12rem .55rem; border-radius:999px;
+    background:rgba(109,140,255,.18); border:1px solid rgba(109,140,255,.4); color:#c7d2fe; }
+  .pill.perm { background:rgba(52,211,153,.14); border-color:rgba(52,211,153,.4); color:#bbf7d0; }
+  .pill.world { background:rgba(251,191,36,.14); border-color:rgba(251,191,36,.4); color:#fde68a; }
+  .row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
+  input[type=text] {
+    padding:.65rem .8rem; font-size:1rem; color:var(--fg); background:rgba(255,255,255,.05);
+    border:1px solid var(--card-br); border-radius:11px; outline:none; transition:border-color .15s, box-shadow .15s;
+  }
+  input[type=text]:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  .btn {
+    font-size:.93rem; font-weight:600; padding:.6rem 1.15rem; border:0; border-radius:11px; color:#fff;
+    cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent2));
+    box-shadow:0 8px 24px -10px var(--ring); transition:transform .08s; white-space:nowrap;
+  }
+  .btn:hover { transform:translateY(-1px); }
+  .btn.danger { background:linear-gradient(135deg,#ef4444,#b91c1c); box-shadow:none; }
+
+  table { border-collapse:collapse; width:100%; font-size:.9rem; margin-top:.25rem; }
+  th { text-align:left; color:var(--muted); font-weight:500; font-size:.76rem; text-transform:uppercase;
+    letter-spacing:.08em; padding:.4rem .7rem; border-bottom:1px solid var(--card-br); white-space:nowrap; }
+  td { padding:.6rem .7rem; border-bottom:1px solid rgba(255,255,255,.06); vertical-align:middle; }
+  tr:last-child td { border-bottom:0; }
+  .mono { font-family:ui-monospace,"SF Mono",monospace; }
+  .self { font-size:.68rem; font-weight:600; margin-left:.4rem; padding:.05rem .4rem; border-radius:999px;
+    background:rgba(109,140,255,.2); border:1px solid rgba(109,140,255,.45); color:#c7d2fe; vertical-align:middle; }
+  .idle-fresh { color:var(--ok); }
+  .idle-warn  { color:var(--amber); font-weight:600; }
+  .idle-danger{ color:var(--danger); font-weight:700; }
+  .chips { display:flex; flex-wrap:wrap; gap:.45rem; margin-top:.9rem; }
+  .chip { font-family:ui-monospace,monospace; font-size:.85rem; font-weight:600; padding:.28rem .65rem;
+    border-radius:999px; background:linear-gradient(135deg, rgba(251,191,36,.18), rgba(245,158,11,.18));
+    border:1px solid rgba(251,191,36,.4); color:#fde68a; }
+  .empty { color:var(--muted); font-size:.9rem; padding:.8rem .7rem; }
+
+  .banner {
+    display:flex; gap:.6rem; align-items:flex-start; background:rgba(251,191,36,.12);
+    border:1px solid rgba(251,191,36,.4); color:#fde68a; border-radius:13px;
+    padding:.7rem 1rem; margin-bottom:1.25rem; font-size:.9rem;
+  }
+  .banner.lock { background:rgba(248,113,113,.12); border-color:rgba(248,113,113,.45); color:#fecaca; }
+  .banner svg { width:20px; height:20px; flex:none; margin-top:1px; }
+  .foot { color:var(--muted); font-size:.78rem; text-align:center; margin-top:.5rem; }
+
+  /* Rule-preview modal */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(5,8,20,.6); backdrop-filter:blur(3px);
+    display:none; align-items:center; justify-content:center; padding:1.25rem; z-index:50; }
+  .modal-backdrop.open { display:flex; }
+  .modal { background:linear-gradient(160deg,#141b33,#0f1528); border:1px solid var(--card-br);
+    border-radius:18px; box-shadow:var(--shadow); width:100%; max-width:560px; max-height:85vh;
+    overflow:auto; padding:1.5rem 1.6rem; }
+  .modal h3 { margin:0 0 .3rem; font-size:1.15rem; }
+  .modal .mdesc { color:var(--muted); font-size:.86rem; margin:0 0 1rem; }
+  .difsec { margin:.9rem 0; }
+  .difsec h4 { font-size:.78rem; text-transform:uppercase; letter-spacing:.08em; margin:0 0 .4rem; color:var(--muted); }
+  .difitem { font-family:ui-monospace,monospace; font-size:.86rem; padding:.3rem .6rem; border-radius:8px;
+    margin-bottom:.3rem; border:1px solid var(--card-br); }
+  .difitem.add { background:rgba(52,211,153,.12); border-color:rgba(52,211,153,.4); }
+  .difitem.add::before { content:"+ "; color:var(--ok); font-weight:700; }
+  .difitem.del { background:rgba(248,113,113,.12); border-color:rgba(248,113,113,.4); }
+  .difitem.del::before { content:"− "; color:var(--danger); font-weight:700; }
+  .difitem.cur { background:rgba(255,255,255,.03); color:var(--muted); }
+  .difnone { color:var(--muted); font-size:.85rem; }
+  .modal-actions { display:flex; gap:.6rem; justify-content:flex-end; margin-top:1.25rem; flex-wrap:wrap; }
+  .modal .loading { color:var(--muted); font-size:.9rem; padding:1rem 0; }
+  .modal .err { color:#fecaca; background:rgba(248,113,113,.12); border:1px solid rgba(248,113,113,.4);
+    border-radius:10px; padding:.6rem .8rem; font-size:.88rem; }
+
+  /* Mobile: stack stats, turn tables into cards, full-width controls */
+  @media (max-width:560px) {
+    body { padding:1.5rem .9rem 3rem; }
+    .stats { grid-template-columns:1fr 1fr 1fr; gap:.55rem; }
+    .stat { padding:.7rem .6rem; border-radius:13px; }
+    .stat .n { font-size:1.4rem; }
+    .stat .l { font-size:.72rem; }
+    .card { padding:1.15rem 1.1rem; border-radius:15px; }
+    .row input[type=text] { flex:1 1 100%; min-width:0; }
+    .row .btn { flex:1 1 100%; }
+
+    /* table -> stacked cards */
+    table, thead, tbody, tr, td { display:block; width:100%; }
+    thead { display:none; }
+    tr { border:1px solid var(--card-br); border-radius:12px; padding:.6rem .8rem; margin-bottom:.7rem;
+      background:rgba(255,255,255,.03); }
+    tr:last-child { margin-bottom:0; }
+    td { border:0; padding:.2rem 0; display:flex; justify-content:space-between; gap:1rem; }
+    td::before { content:attr(data-label); color:var(--muted); font-size:.78rem; }
+    td:last-child { margin-top:.5rem; }
+    td .btn { width:100%; }
+    td.ipcell { font-size:1.02rem; font-weight:600; }
+    td.ipcell::before { content:""; }
+    .empty { text-align:center; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l7 3v6c0 4.4-3 7.9-7 9-4-1.1-7-4.6-7-9V5l7-3z" fill="url(#g)" stroke="rgba(255,255,255,.5)" stroke-width="1"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g" x1="5" y1="2" x2="19" y2="21"><stop stop-color="#6d8cff"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
+      portknock <span class="dot">控制台</span>
+    </div>
+    <form method="post" action="/admin/logout"><button class="ghost" type="submit">退出</button></form>
+  </div>
+
+  {{if .DryRun}}
+  <div class="banner">
+    <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4M12 16.5v.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    dry-run 模式：ufw 命令仅记录日志，不会真正执行。
+  </div>
+  {{end}}
+
+  {{if .Lockout}}
+  <div class="banner lock">
+    <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4M12 16.5v.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    <div>你当前的 IP <span class="mono">{{.AdminIP}}</span> 不在固定白名单中。若其动态规则过期、或被移除，你可能无法再访问本机。建议把它加入下方「固定白名单 IP」。</div>
+  </div>
+  {{end}}
+
+  <!-- A. 概览统计 -->
+  <div class="stats">
+    <div class="stat world"><div class="n">{{.NumPorts}}</div><div class="l">对外开放端口</div></div>
+    <div class="stat perm"><div class="n">{{.NumFixed}}</div><div class="l">固定白名单 IP</div></div>
+    <div class="stat dyn"><div class="n">{{.NumDynamic}}</div><div class="l">动态放行 IP</div></div>
+  </div>
+
+  <div class="card">
+    <h2>
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h18" stroke="currentColor" stroke-width="1.6"/></svg>
+      对外开放端口<span class="pill world">所有人可访问</span>
+    </h2>
+    <p class="desc">这些 TCP 端口对<strong>任意 IP</strong> 开放。用逗号或空格分隔端口号。</p>
+    <form method="post" action="/admin/ports" class="row pk-form" data-action="ports" data-value-field="ports" data-title="保存开放端口">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="text" name="ports" value="{{.PortsStr}}" placeholder="例如 80, 443" inputmode="numeric" style="flex:1; min-width:240px;">
+      <button class="btn" type="submit">保存</button>
+    </form>
+    {{if .Ports}}<div class="chips">{{range .Ports}}<span class="chip">{{.}}/tcp</span>{{end}}</div>{{end}}
+  </div>
+
+  <div class="card">
+    <h2>
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l7 3v6c0 4.4-3 7.9-7 9-4-1.1-7-4.6-7-9V5l7-3z" stroke="currentColor" stroke-width="1.6"/></svg>
+      固定白名单 IP<span class="pill perm">永久 · 全端口</span>
+    </h2>
+    <p class="desc">这些 IP 可访问本机<strong>所有端口</strong>，永不过期。</p>
+    <form method="post" action="/admin/fixed" class="row pk-form" data-action="fixed-add" data-value-field="ip" data-title="添加固定白名单 IP">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="action" value="add">
+      <input type="text" name="ip" placeholder="例如 203.0.113.5" required style="flex:1; min-width:240px;">
+      <button class="btn" type="submit">添加</button>
+    </form>
+    {{if not .FixedIPs}}
+      {{if .Lockout}}
+      <div class="row" style="margin-top:.6rem;">
+        <form method="post" action="/admin/fixed" class="pk-form" data-action="fixed-add" data-value="{{.AdminIP}}" data-title="把本机 IP 加为固定">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="action" value="add">
+          <input type="hidden" name="ip" value="{{.AdminIP}}">
+          <button class="btn" type="submit">把我的 IP（{{.AdminIP}}）加为固定</button>
+        </form>
+      </div>
+      {{end}}
+    {{end}}
+    <table>
+      <tbody>
+      {{range .FixedIPs}}
+        <tr>
+          <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
+          <td data-label="操作" style="text-align:right;">
+            <form method="post" action="/admin/fixed" class="pk-form" data-action="fixed-remove" data-value="{{.IP}}" data-title="删除固定白名单 IP {{.IP}}">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="action" value="remove">
+              <input type="hidden" name="ip" value="{{.IP}}">
+              <button class="btn danger" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td class="empty" colspan="2">（暂无固定 IP）</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      动态放行 IP<span class="pill">全端口 · 空闲 {{.Expiry}} 回收</span>
+    </h2>
+    <p class="desc">用户自助提交的 IP，可访问所有端口；超过 {{.Expiry}} 无连接记录将自动移除。</p>
+    <table>
+      <thead><tr><th>IP</th><th>首次放行</th><th>最后活动</th><th>已空闲</th><th></th></tr></thead>
+      <tbody>
+      {{range .Dynamic}}
+        <tr>
+          <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
+          <td data-label="首次放行" class="mono" style="color:var(--muted)">{{.AddedAt}}</td>
+          <td data-label="最后活动" class="mono" style="color:var(--muted)">{{.LastSeen}}</td>
+          <td data-label="已空闲" class="mono idle-{{.IdleLevel}}">{{.IdleFor}}</td>
+          <td data-label="操作" style="text-align:right;">
+            <form method="post" action="/admin/revoke" class="pk-form" data-action="revoke" data-value="{{.IP}}" data-title="立即移除 {{.IP}}">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="ip" value="{{.IP}}">
+              <button class="btn danger" type="submit">立即移除</button>
+            </form>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td class="empty" colspan="5">（暂无动态放行 IP）</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">页面每 30 秒自动刷新空闲状态 · 变更前会预览防火墙规则</div>
+</div>
+
+<div class="modal-backdrop" id="pk-modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pk-modal-title">
+    <h3 id="pk-modal-title">确认变更</h3>
+    <p class="mdesc">以下是本次操作对防火墙规则的影响预览。确认后才会真正下发到 ufw。</p>
+    <div id="pk-modal-body"><div class="loading">正在读取当前防火墙规则…</div></div>
+    <div class="modal-actions">
+      <button class="ghost" id="pk-cancel" type="button">取消</button>
+      <button class="btn" id="pk-confirm" type="button" disabled>确认并应用</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var pendingForm = null, refreshPaused = false;
+  var modal = document.getElementById('pk-modal');
+  var body  = document.getElementById('pk-modal-body');
+  var title = document.getElementById('pk-modal-title');
+  var btnOK = document.getElementById('pk-confirm');
+  var btnNo = document.getElementById('pk-cancel');
+
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+  function closeModal(){ modal.classList.remove('open'); refreshPaused = false; pendingForm = null; }
+
+  function renderDiff(d){
+    function sec(titleTxt, cls, items, emptyTxt){
+      var h = '<div class="difsec"><h4>' + titleTxt + '</h4>';
+      if (!items || !items.length) return h + '<div class="difnone">' + emptyTxt + '</div></div>';
+      h += items.map(function(i){ return '<div class="difitem ' + cls + '">' + esc(i) + '</div>'; }).join('');
+      return h + '</div>';
+    }
+    var html = sec('本次新增', 'add', d.add, '（无新增）')
+             + sec('本次删除', 'del', d.delete, '（无删除）')
+             + sec('变更后全部规则', 'cur', afterRules(d), '（无规则）');
+    body.innerHTML = html;
+    btnOK.disabled = false;
+    // Highlight when nothing changes.
+    if ((!d.add || !d.add.length) && (!d.delete || !d.delete.length)) {
+      body.insertAdjacentHTML('afterbegin', '<p class="mdesc">本次操作不会改变任何防火墙规则。</p>');
+    }
+  }
+  // afterRules = current − deleted + added, for a final-state view.
+  function afterRules(d){
+    var del = {}; (d.delete||[]).forEach(function(x){ del[x]=1; });
+    var out = (d.current||[]).filter(function(x){ return !del[x]; });
+    (d.add||[]).forEach(function(x){ out.push(x); });
+    return out.sort();
+  }
+
+  function openPreview(form){
+    pendingForm = form; refreshPaused = true;
+    title.textContent = form.getAttribute('data-title') || '确认变更';
+    body.innerHTML = '<div class="loading">正在读取当前防火墙规则…</div>';
+    btnOK.disabled = true;
+    modal.classList.add('open');
+
+    var action = form.getAttribute('data-action');
+    var value  = form.getAttribute('data-value');
+    if (value === null) {
+      var vf = form.getAttribute('data-value-field');
+      var el = vf ? form.querySelector('[name="' + vf + '"]') : null;
+      value = el ? el.value : '';
+    }
+    var url = '/admin/preview?action=' + encodeURIComponent(action) + '&value=' + encodeURIComponent(value);
+    fetch(url, { headers: { 'Accept': 'application/json' } })
+      .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+      .then(function(res){
+        if (!res.ok) { body.innerHTML = '<div class="err">' + esc(res.j.error || '预览失败') + '</div>'; return; }
+        renderDiff(res.j);
+      })
+      .catch(function(){ body.innerHTML = '<div class="err">无法连接服务器，预览失败。</div>'; });
+  }
+
+  document.querySelectorAll('form.pk-form').forEach(function(form){
+    form.addEventListener('submit', function(ev){
+      if (form.dataset.pkConfirmed === '1') return; // allow the real submit
+      ev.preventDefault();
+      // Basic required-field guard for the IP/ports inputs.
+      var vf = form.getAttribute('data-value-field');
+      if (vf) { var el = form.querySelector('[name="' + vf + '"]'); if (el && !el.value.trim()) { el.focus(); return; } }
+      openPreview(form);
+    });
+  });
+
+  btnNo.addEventListener('click', closeModal);
+  modal.addEventListener('click', function(e){ if (e.target === modal) closeModal(); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape' && modal.classList.contains('open')) closeModal(); });
+  btnOK.addEventListener('click', function(){
+    if (!pendingForm) return;
+    pendingForm.dataset.pkConfirmed = '1';
+    pendingForm.submit();
+  });
+
+  // F. 自动刷新空闲状态：输入中或预览弹窗打开时暂停。
+  setInterval(function(){
+    if (refreshPaused) return;
+    var a = document.activeElement;
+    if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) return;
+    location.reload();
+  }, 30000);
+})();
+</script>
+</body>
+</html>

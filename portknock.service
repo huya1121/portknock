@@ -1,0 +1,25 @@
+[Unit]
+Description=portknock - web-based ufw IP whitelist
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ufw requires root.
+User=root
+ExecStart=/usr/local/bin/portknock \
+    --listen 127.0.0.1:8080 \
+    --state /var/lib/portknock/state.json \
+    --expiry 48h \
+    --poll 2m
+# Provide the admin password out of the process args (args are visible in `ps`).
+Environment=PORTKNOCK_ADMIN_PASS=change-me
+Restart=on-failure
+RestartSec=3
+# Hardening (keep root for ufw, but drop the rest).
+NoNewPrivileges=no
+ProtectSystem=full
+ReadWritePaths=/var/lib/portknock
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

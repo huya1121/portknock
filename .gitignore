@@ -1,0 +1,4 @@
+/portknock
+/portknock.exe
+*.tmp
+state.json

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理员登录 · portknock</title>
+<style>
+  :root {
+    --bg0:#0b1020; --bg1:#131a35; --card:rgba(255,255,255,.055); --card-br:rgba(255,255,255,.1);
+    --fg:#eef1f8; --muted:#9aa4c4; --accent:#6d8cff; --accent2:#8b5cf6;
+    --err:#f87171; --ring:rgba(109,140,255,.5); --shadow:0 20px 60px -20px rgba(0,0,0,.6);
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    margin:0; color:var(--fg); font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.6; display:grid; place-items:center; padding:2rem 1.25rem;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(139,92,246,.22), transparent 60%),
+      radial-gradient(1000px 500px at 110% 10%, rgba(109,140,255,.22), transparent 55%),
+      linear-gradient(160deg, var(--bg0), var(--bg1));
+    background-attachment:fixed;
+  }
+  .wrap { width:100%; max-width:380px; }
+  .brand { display:flex; align-items:center; gap:.6rem; justify-content:center; margin-bottom:1.5rem; font-weight:650; }
+  .brand svg { width:26px; height:26px; }
+  .card {
+    background:var(--card); border:1px solid var(--card-br); border-radius:20px;
+    padding:1.9rem; backdrop-filter:blur(14px); box-shadow:var(--shadow);
+  }
+  h1 { font-size:1.2rem; margin:0 0 .3rem; }
+  .sub { color:var(--muted); font-size:.9rem; margin:0 0 1.4rem; }
+  label { display:block; color:var(--muted); font-size:.82rem; margin-bottom:.4rem; }
+  input {
+    width:100%; box-sizing:border-box; padding:.75rem .85rem; font-size:1rem; color:var(--fg);
+    background:rgba(255,255,255,.05); border:1px solid var(--card-br); border-radius:12px;
+    margin-bottom:1.2rem; outline:none; transition:border-color .15s, box-shadow .15s;
+  }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  .btn {
+    width:100%; font-size:1rem; font-weight:650; padding:.8rem 1.3rem; border:0; border-radius:12px;
+    color:#fff; cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent2));
+    box-shadow:0 10px 30px -10px var(--ring); transition:transform .08s, box-shadow .2s;
+  }
+  .btn:hover { transform:translateY(-1px); }
+  .err {
+    display:flex; gap:.5rem; align-items:center; color:#fecaca; background:rgba(248,113,113,.12);
+    border:1px solid rgba(248,113,113,.4); border-radius:12px; padding:.6rem .8rem;
+    margin-bottom:1.1rem; font-size:.9rem;
+  }
+  .err svg { width:18px; height:18px; color:var(--err); flex:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l7 3v6c0 4.4-3 7.9-7 9-4-1.1-7-4.6-7-9V5l7-3z" fill="url(#g)" stroke="rgba(255,255,255,.5)" stroke-width="1"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g" x1="5" y1="2" x2="19" y2="21"><stop stop-color="#6d8cff"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
+    <span>portknock</span>
+  </div>
+  <div class="card">
+    <h1>管理员登录</h1>
+    <p class="sub">请输入管理密码以进入控制台。</p>
+    {{if .Error}}
+    <div class="err">
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v6M12 16.5v.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      {{.Error}}
+    </div>
+    {{end}}
+    <form method="post" action="/admin/login">
+      <label>密码</label>
+      <input type="password" name="password" autofocus required>
+      <button class="btn" type="submit">登录</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,46 @@
+name: Release
+
+# Build static Linux binaries and attach them to a GitHub Release whenever a
+# version tag (v*) is pushed:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            out="dist/portknock-linux-${arch}"
+            GOOS=linux GOARCH="${arch}" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "${out}" .
+            sha256sum "${out}" > "${out}.sha256"
+          done
+          ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/portknock-linux-amd64
+            dist/portknock-linux-amd64.sha256
+            dist/portknock-linux-arm64
+            dist/portknock-linux-arm64.sha256
+          generate_release_notes: true
