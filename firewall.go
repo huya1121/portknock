@@ -30,16 +30,17 @@ func NewFirewall(dryRun bool) *Firewall { return &Firewall{dryRun: dryRun} }
 
 const commentPrefix = "portknock:"
 
-// run executes ufw with the given args (never through a shell). All ufw calls
-// are serialized: ufw/iptables take a single global lock and abort when invoked
-// concurrently, so the janitor and HTTP handlers must not race here.
+// run executes ufw with the given args (never through a shell). Caller must
+// hold f.mu: ufw/iptables take a single global lock and abort when invoked
+// concurrently, so all ufw calls are serialized by the public methods that
+// acquire f.mu before delegating to the *Locked helpers. (run itself must NOT
+// lock — it is reached only from code already holding the lock, and sync.Mutex
+// is not reentrant.)
 func (f *Firewall) run(args ...string) (string, error) {
 	if f.dryRun {
 		log.Printf("[dry-run] ufw %s", strings.Join(args, " "))
 		return "", nil
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	cmd := exec.Command("ufw", args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -308,3 +309,4 @@ func parseManagedRules(status string) []managedRule {
 	}
 	return rules
 }
+
