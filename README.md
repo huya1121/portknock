@@ -94,6 +94,8 @@ ssh -L 8080:127.0.0.1:8080 -p 222 root@服务器IP
 | `sudo portknock-ctl restore <文件>` | 从备份恢复并重启 |
 | `sudo portknock-ctl uninstall [--purge]` | 卸载（`--purge` 连状态、密钥、SSH 规则一起删） |
 
+> 文档里的 `sudo` 是给普通用户看的。如果你本来就是 root（很多 VPS 默认 root 登录，也没装 sudo），把命令里的 `sudo ` 去掉直接跑即可，否则会报 `sudo: command not found`。
+
 ## 反向代理和真实 IP
 
 portknock 靠访客 IP 决定放行谁，所以要不要开 `--trust-proxy`，取决于你怎么暴露它。

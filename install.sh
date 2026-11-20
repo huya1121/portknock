@@ -57,6 +57,15 @@ say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# SUDO is the prefix shown in hints printed to the user. On a machine without
+# sudo (e.g. logged in as root directly) it's empty, so copied commands don't
+# fail with "sudo: command not found".
+if command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo "
+else
+  SUDO=""
+fi
+
 need_root() { [ "$(id -u)" -eq 0 ] || die "请用 root 运行（sudo）。"; }
 
 gen_secret() { head -c "${1:-18}" /dev/urandom | base64 | tr -d '/+=' | cut -c1-"${2:-24}"; }
@@ -80,7 +89,7 @@ check_port() {
   warn "端口 ${port} 似乎已被占用："
   printf '    %s\n' "$line" >&2
   warn "若非 portknock，启动可能失败。可用 PORTKNOCK_LISTEN=地址:端口 换一个端口重装，例如："
-  warn "    curl -fsSL .../install.sh | sudo PORTKNOCK_LISTEN=0.0.0.0:8888 bash"
+  warn "    curl -fsSL .../install.sh | ${SUDO}PORTKNOCK_LISTEN=0.0.0.0:8888 bash"
 }
 
 # --- install / update -------------------------------------------------------
@@ -180,7 +189,7 @@ EOF
     echo "  Cookie：  Secure 关闭（HTTP 可正常登录）。上了 HTTPS 再用 PORTKNOCK_SECURE_COOKIE=1 开启"
   fi
   echo
-  echo "以后可用： sudo portknock-ctl status | creds | update | uninstall | logs"
+  echo "以后可用： ${SUDO}portknock-ctl status | creds | update | uninstall | logs"
 }
 
 # Default publicly-open ports seeded into a fresh state.json (and allowed via
@@ -278,7 +287,7 @@ RestartSec=3
 # each optional path tells systemd to ignore it if it doesn't exist (paths vary
 # by distro; a missing one would otherwise abort startup with 226/NAMESPACE).
 ProtectSystem=full
-ReadWritePaths=${STATE_DIR} /etc/ufw -/lib/ufw -/var/lib/ufw -/run
+ReadWritePaths=${STATE_DIR} /etc/ufw /etc/default -/lib/ufw -/var/lib/ufw -/run
 PrivateTmp=yes
 
 [Install]
