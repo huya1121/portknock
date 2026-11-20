@@ -56,7 +56,7 @@ func main() {
 	flag.DurationVar(&cfg.Poll, "poll", 2*time.Minute, "conntrack poll interval")
 	flag.DurationVar(&cfg.Expiry, "expiry", 48*time.Hour, "idle expiry window for dynamic IPs")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "log ufw commands instead of executing them")
-	flag.BoolVar(&cfg.SecureCookie, "secure-cookie", true, "set Secure flag on session cookie (disable only for local HTTP testing)")
+	flag.BoolVar(&cfg.SecureCookie, "secure-cookie", false, "set Secure flag on cookies (enable only when served over HTTPS; required cookies are dropped by browsers on plain HTTP if set)")
 	flag.StringVar(&cfg.APIKey, "api-key", "", "bearer token for the JSON API (or env PORTKNOCK_API_KEY); empty disables the API")
 	flag.Parse()
 
@@ -102,6 +102,7 @@ func main() {
 	mux.HandleFunc("/admin/fixed", srv.handleFixed)
 	mux.HandleFunc("/admin/revoke", srv.handleRevoke)
 	mux.HandleFunc("/admin/preview", srv.handlePreview)
+	mux.HandleFunc("/admin/firewall", srv.handleFirewall)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 
 	log.Printf("portknock %s listening on %s (dry-run=%v, expiry=%s, poll=%s, api=%v)", version, cfg.Listen, cfg.DryRun, cfg.Expiry, cfg.Poll, cfg.APIKey != "")
@@ -309,6 +310,7 @@ type adminData struct {
 	NumPorts   int
 	NumFixed   int
 	NumDynamic int
+	FWActive   bool // whether ufw is currently enabled
 }
 
 type fixedView struct {
@@ -411,6 +413,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		NumPorts:   len(st.Ports),
 		NumFixed:   len(st.FixedIPs),
 		NumDynamic: len(st.Dynamic),
+		FWActive:   s.fw.IsActive(),
 	})
 }
 
@@ -627,6 +630,34 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleFirewall is the emergency escape hatch: turn ufw off (restore full
+// access) or back on. POST action=disable|enable.
+func (s *Server) handleFirewall(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	switch r.FormValue("action") {
+	case "disable":
+		if err := s.fw.Disable(); err != nil {
+			log.Printf("firewall disable: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("ufw DISABLED from admin panel (all ports now open)")
+	case "enable":
+		if err := s.fw.Enable(s.store.Snapshot()); err != nil {
+			log.Printf("firewall enable: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("ufw ENABLED from admin panel")
+	default:
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
 // parsePorts accepts comma/space/newline-separated port numbers.
 func parsePorts(raw string) []int {
 	fields := strings.FieldsFunc(raw, func(r rune) bool {
@@ -647,3 +678,4 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 		log.Printf("render %s: %v", name, err)
 	}
 }
+

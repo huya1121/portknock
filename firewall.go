@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -23,10 +24,29 @@ import (
 //     from ANY source.
 type Firewall struct {
 	dryRun bool
+	bin    string     // resolved absolute path to the ufw binary
 	mu     sync.Mutex // serializes ufw invocations (ufw/iptables hold a global lock)
 }
 
-func NewFirewall(dryRun bool) *Firewall { return &Firewall{dryRun: dryRun} }
+func NewFirewall(dryRun bool) *Firewall {
+	return &Firewall{dryRun: dryRun, bin: resolveUFW()}
+}
+
+// resolveUFW locates the ufw binary. It prefers $PATH, then falls back to the
+// usual absolute locations, because systemd units often run with a minimal PATH
+// that excludes /usr/sbin where ufw lives. Returns "ufw" if nothing is found so
+// the error message is still meaningful.
+func resolveUFW() string {
+	if p, err := exec.LookPath("ufw"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/usr/sbin/ufw", "/sbin/ufw", "/usr/bin/ufw", "/bin/ufw", "/usr/local/sbin/ufw"} {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return "ufw"
+}
 
 const commentPrefix = "portknock:"
 
@@ -41,7 +61,7 @@ func (f *Firewall) run(args ...string) (string, error) {
 		log.Printf("[dry-run] ufw %s", strings.Join(args, " "))
 		return "", nil
 	}
-	cmd := exec.Command("ufw", args...)
+	cmd := exec.Command(f.bin, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -109,6 +129,41 @@ func (f *Firewall) RevokeIP(ip string) error {
 	return f.deleteIPLocked(ip)
 }
 
+// Disable turns the whole firewall off (`ufw disable`) — an emergency escape so
+// an admin locked out by a misconfiguration can restore full access from the
+// panel. All ports become reachable until Enable is called.
+func (f *Firewall) Disable() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, err := f.run("disable")
+	return err
+}
+
+// Enable turns the firewall back on (`ufw --force enable`) and re-applies the
+// current state. --force avoids the interactive "may disrupt SSH" prompt.
+func (f *Firewall) Enable(st State) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, err := f.run("--force", "enable"); err != nil {
+		return err
+	}
+	return f.reconcileLocked(st)
+}
+
+// IsActive reports whether ufw is currently enabled.
+func (f *Firewall) IsActive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dryRun {
+		return true
+	}
+	out, err := f.run("status")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, "Status: active")
+}
+
 // ReconcileAll makes ufw match the given state exactly. It holds the ufw lock
 // for the whole operation and applies changes "add-before-delete": rules that
 // should still exist are never removed, so a currently-whitelisted IP keeps
@@ -117,7 +172,11 @@ func (f *Firewall) RevokeIP(ip string) error {
 func (f *Firewall) ReconcileAll(st State) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.reconcileLocked(st)
+}
 
+// reconcileLocked is ReconcileAll's body. Caller must hold f.mu.
+func (f *Firewall) reconcileLocked(st State) error {
 	desired := desiredRuleLabels(st) // key -> human label
 	existing, err := f.listManagedRulesLocked()
 	if err != nil {

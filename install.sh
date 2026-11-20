@@ -10,12 +10,16 @@
 # Once installed, this script is also available locally as `portknock-ctl`:
 #   sudo portknock-ctl <command>
 #
+# Run with no arguments on a terminal (sudo portknock-ctl) to open an
+# interactive menu. A piped install (curl | sudo bash) runs install directly.
+#
 # Commands:
 #   install            Install or upgrade, then start (default).
 #   update             Alias of install (in-place upgrade; state & creds kept).
 #   uninstall          Stop, disable, and remove the service & binary.
 #                        Add --purge to also delete state dir and env file.
 #   status             Show service status and current whitelist summary.
+#   urls               Print access URLs and a ready-to-run API example.
 #   creds              Print the admin password and API key.
 #   reset-password     Generate a new admin password (and API key) and restart.
 #   logs               Follow the service logs (journalctl -f).
@@ -34,6 +38,12 @@ STATE_FILE="${STATE_DIR}/state.json"
 ENV_FILE="/etc/portknock.env"
 SERVICE="/etc/systemd/system/portknock.service"
 LISTEN="${PORTKNOCK_LISTEN:-127.0.0.1:8080}"
+# Set PORTKNOCK_TRUST_PROXY=1 when portknock sits behind a reverse proxy
+# (nginx/Caddy). It makes the service read the real client IP from the last
+# X-Forwarded-For hop instead of the proxy's 127.0.0.1. Only enable this when a
+# trusted proxy is actually in front AND portknock listens on localhost, or
+# anyone could spoof the header to whitelist arbitrary IPs.
+TRUST_PROXY="${PORTKNOCK_TRUST_PROXY:-0}"
 # Keep SSH reachable so enabling/using ufw can't lock you out. Set
 # PORTKNOCK_SSH_PORT to override detection; set PORTKNOCK_NO_SSH=1 to skip.
 SSH_PORT="${PORTKNOCK_SSH_PORT:-}"
@@ -74,8 +84,7 @@ cmd_install() {
 
   say "下载 ${asset} ..."
   local tmp; tmp="$(mktemp)"
-  trap 'rm -f "$tmp" "$tmp.sha256"' RETURN
-  curl -fsSL -o "$tmp" "$url" || die "下载失败：${url}（确认已打 v* tag 并生成 Release）"
+  curl -fsSL -o "$tmp" "$url" || { rm -f "$tmp"; die "下载失败：${url}（确认已打 v* tag 并生成 Release）"; }
 
   if curl -fsSL -o "$tmp.sha256" "${url}.sha256" 2>/dev/null; then
     local want got
@@ -86,6 +95,7 @@ cmd_install() {
   fi
 
   install -m 0755 "$tmp" "$BIN_PATH"
+  rm -f "$tmp" "$tmp.sha256"
   say "已安装二进制：${BIN_PATH}"
   mkdir -p "$STATE_DIR"
 
@@ -131,6 +141,11 @@ EOF
   echo "  用户页：  http://${LISTEN}/"
   echo "  管理台：  http://${LISTEN}/admin"
   echo "  SSH：     已放行 $(protected_ssh_port)/tcp（防锁死，仅此端口管理台删不掉）"
+  if [ "$TRUST_PROXY" = "1" ]; then
+    echo "  反代：    已启用 --trust-proxy（从 X-Forwarded-For 读取真实客户端 IP）"
+  else
+    echo "  反代：    未启用。若前面有 nginx/Caddy，请用 PORTKNOCK_TRUST_PROXY=1 重装，否则只会看到代理 IP"
+  fi
   echo
   echo "以后可用： sudo portknock-ctl status | creds | update | uninstall | logs"
 }
@@ -208,6 +223,11 @@ allow_ssh() {
 }
 
 write_service() {
+  local extra=""
+  # A reverse proxy implies HTTPS is terminated in front, so mark cookies Secure.
+  # Plain-HTTP installs leave Secure off, or browsers would drop the CSRF/session
+  # cookie and every form POST would fail.
+  [ "$TRUST_PROXY" = "1" ] && extra=" --trust-proxy --secure-cookie=true"
   cat > "$SERVICE" <<EOF
 [Unit]
 Description=portknock - web-based ufw IP whitelist
@@ -216,12 +236,18 @@ Wants=network-online.target
 
 [Service]
 User=root
+# Ensure /usr/sbin (where ufw lives) is on PATH; systemd's default omits it.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=${ENV_FILE}
-ExecStart=${BIN_PATH} --listen ${LISTEN} --state ${STATE_FILE} --expiry 48h --poll 2m
+ExecStart=${BIN_PATH} --listen ${LISTEN} --state ${STATE_FILE} --expiry 48h --poll 2m${extra}
 Restart=on-failure
 RestartSec=3
+# ProtectSystem=full makes /etc read-only; ufw must write its rule files there,
+# so allow-list the paths ufw and portknock need to write. The leading "-" on
+# each optional path tells systemd to ignore it if it doesn't exist (paths vary
+# by distro; a missing one would otherwise abort startup with 226/NAMESPACE).
 ProtectSystem=full
-ReadWritePaths=${STATE_DIR}
+ReadWritePaths=${STATE_DIR} /etc/ufw -/lib/ufw -/var/lib/ufw -/run
 PrivateTmp=yes
 
 [Install]
@@ -239,6 +265,57 @@ print_creds() {
 }
 
 cmd_creds() { need_root; print_creds; }
+
+# effective_listen reads the actual --listen value from the installed service
+# (so it reflects what's really running), falling back to the script default.
+effective_listen() {
+  if [ -f "$SERVICE" ]; then
+    local l
+    l="$(grep -oE -- '--listen[ =][^ ]+' "$SERVICE" 2>/dev/null | head -n1 | sed -E 's/--listen[ =]//')"
+    [ -n "${l:-}" ] && { echo "$l"; return; }
+  fi
+  echo "$LISTEN"
+}
+
+# cmd_urls prints the access URLs and a ready-to-run API example (with key).
+cmd_urls() {
+  need_root
+  local listen host port scheme base apikey
+  listen="$(effective_listen)"
+  host="${listen%:*}"; port="${listen##*:}"
+  # A bind on 0.0.0.0/:: is reachable via the machine's public IP; 127.0.0.1 is
+  # local-only (typically fronted by a reverse proxy).
+  case "$host" in
+    0.0.0.0|""|"::") host="<服务器IP或域名>" ;;
+  esac
+  scheme="http"
+  grep -q -- '--secure-cookie=true' "$SERVICE" 2>/dev/null && scheme="https"
+  base="${scheme}://${host}:${port}"
+
+  echo "  用户提交页： ${base}/"
+  echo "  管理控制台： ${base}/admin"
+  echo
+  if [ -f "$ENV_FILE" ]; then
+    apikey="$(grep PORTKNOCK_API_KEY "$ENV_FILE" | cut -d= -f2-)"
+  fi
+  if [ -n "${apikey:-}" ]; then
+    echo "  API 提交（放行调用方自己的 IP）："
+    echo "    curl -X POST ${base}/api/grant \\"
+    echo "         -H \"Authorization: Bearer ${apikey}\""
+    echo
+    echo "  API 提交（放行指定 IP）："
+    echo "    curl -X POST ${base}/api/grant \\"
+    echo "         -H \"Authorization: Bearer ${apikey}\" \\"
+    echo "         -H \"Content-Type: application/json\" \\"
+    echo "         -d '{\"ip\":\"203.0.113.9\"}'"
+  else
+    warn "未找到 API 密钥（${ENV_FILE}）；API 可能未配置。"
+  fi
+  if [ "$scheme" = "http" ] && [ "$host" != "127.0.0.1" ]; then
+    echo
+    warn "当前为明文 HTTP。生产环境建议前置 nginx/Caddy 终止 HTTPS，并用 PORTKNOCK_TRUST_PROXY=1 重装。"
+  fi
+}
 
 cmd_status() {
   systemctl status portknock --no-pager -l 2>/dev/null || warn "服务未安装或未运行。"
@@ -321,13 +398,14 @@ cmd_uninstall() {
 
 # --- dispatch ---------------------------------------------------------------
 
-main() {
-  local cmd="${1:-install}"; shift || true
+run_cmd() {
+  local cmd="$1"; shift || true
   case "$cmd" in
     install|update)   cmd_install ;;
     uninstall|remove) cmd_uninstall "$@" ;;
     status)           cmd_status ;;
     creds|password)   cmd_creds ;;
+    urls|url|api)     cmd_urls ;;
     reset-password)   cmd_reset_password ;;
     logs|log)         cmd_logs ;;
     restart)          cmd_restart ;;
@@ -339,4 +417,80 @@ main() {
   esac
 }
 
+# installed reports whether portknock is already installed on this host.
+installed() { [ -f "$BIN_PATH" ] && [ -f "$SERVICE" ]; }
+
+# menu shows an interactive menu (only on a real terminal with no subcommand).
+menu() {
+  while true; do
+    echo
+    printf '\033[1;36m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[1;36m║        portknock 管理菜单            ║\033[0m\n'
+    printf '\033[1;36m╚══════════════════════════════════════╝\033[0m\n'
+    if installed; then
+      local act="已安装"; systemctl is-active --quiet portknock 2>/dev/null && act="运行中" || act="已停止"
+      echo "  状态：${act}    监听：$(effective_listen)"
+    else
+      echo "  状态：未安装"
+    fi
+    echo "  --------------------------------------"
+    echo "   1) 安装 / 升级"
+    echo "   2) 查看状态与白名单概览"
+    echo "   3) 查看访问链接 / API 调用示例"
+    echo "   4) 查看管理密码 / API 密钥"
+    echo "   5) 重置管理密码"
+    echo "   6) 查看实时日志"
+    echo "   7) 重启服务"
+    echo "   8) 备份状态"
+    echo "   9) 恢复状态"
+    echo "  10) 卸载"
+    echo "   0) 退出"
+    echo "  --------------------------------------"
+    printf "请选择 [0-10]: "
+    local choice; read -r choice || { echo; return 0; }
+    case "$choice" in
+      1) run_cmd install ;;
+      2) run_cmd status ;;
+      3) run_cmd urls ;;
+      4) run_cmd creds ;;
+      5) run_cmd reset-password ;;
+      6) run_cmd logs ;;
+      7) run_cmd restart ;;
+      8) run_cmd backup ;;
+      9)
+        printf "请输入备份文件路径: "; local f; read -r f
+        [ -n "${f:-}" ] && run_cmd restore "$f" || warn "未输入路径，已取消。"
+        ;;
+      10)
+        printf "确认卸载？彻底删除(含状态与密钥)请输入 purge，仅卸载请输入 y，其它取消: "
+        local c; read -r c
+        case "$c" in
+          purge) run_cmd uninstall --purge ;;
+          y|Y)   run_cmd uninstall ;;
+          *)     warn "已取消。" ;;
+        esac
+        ;;
+      0) echo "再见。"; return 0 ;;
+      *) warn "无效选择：$choice" ;;
+    esac
+    printf "\n按回车返回菜单..."; read -r _ || return 0
+  done
+}
+
+main() {
+  # With an explicit subcommand (or piped via curl|bash), run it directly so the
+  # one-line install command is unaffected. Only drop into the interactive menu
+  # when run with no arguments on a real terminal.
+  if [ "$#" -gt 0 ]; then
+    run_cmd "$@"
+    return
+  fi
+  if [ -t 0 ] && [ -t 1 ]; then
+    menu
+  else
+    run_cmd install
+  fi
+}
+
 main "$@"
+

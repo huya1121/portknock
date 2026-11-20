@@ -11,15 +11,20 @@ ExecStart=/usr/local/bin/portknock \
     --state /var/lib/portknock/state.json \
     --expiry 48h \
     --poll 2m
+# Ensure /usr/sbin (where ufw lives) is on PATH; systemd's default omits it.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Provide the admin password out of the process args (args are visible in `ps`).
 Environment=PORTKNOCK_ADMIN_PASS=change-me
 Restart=on-failure
 RestartSec=3
 # Hardening (keep root for ufw, but drop the rest).
 NoNewPrivileges=no
+# ProtectSystem=full makes /etc read-only; ufw must write its rule files there.
+# Leading "-" marks a path optional (ignored if absent; paths vary by distro).
 ProtectSystem=full
-ReadWritePaths=/var/lib/portknock
+ReadWritePaths=/var/lib/portknock /etc/ufw -/lib/ufw -/var/lib/ufw -/run
 PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
+
