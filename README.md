@@ -1,137 +1,121 @@
 # portknock
 
-A small Go service that lets a visitor open the host's firewall (ufw) to **their
-own IP** through a web page, while an admin controls which **ports** are reachable
-and which **IPs** are permanently trusted.
+一个很小的 Go 服务：访客在网页上点一下，就把自己当前的 IP 加进本机 ufw 防火墙白名单；
+管理员在后台控制哪些端口对外开放、哪些 IP 永久放行。适合"平时端口全关，需要时临时放自己进来"的场景。
 
-Access model — two **independent** rule families:
+单文件二进制，只依赖 Go 标准库，没有外部依赖。**只能跑在 Linux + ufw 上**——
+它直接调用 `ufw` 命令，并读 `/proc/net/nf_conntrack` 判断连接活动。
 
-- **Whitelisted IP** (fixed or user-submitted) → that IP may reach **all ports**
-  on the host (`ufw allow from <ip>`).
-- **Whitelisted port** → that TCP port is open to **any source**
-  (`ufw allow <port>/tcp`).
+## 它是怎么放行的
 
-Pages:
+两套互不相干的规则：
 
-- **User page** (`/`) — auto-detects the visitor's IP, shows it, and on confirm
-  grants that IP all-port access.
-- **Admin page** (`/admin`, password-protected) — set the publicly-open ports,
-  manage a permanent fixed-IP whitelist, and view/revoke currently-granted IPs.
-- **Idle expiry** — a user-granted (dynamic) IP and its firewall rule are removed
-  after **48 hours with no connection activity** (any connection from that IP
-  counts). Fixed/admin IPs never expire.
+- **白名单 IP**（固定的或用户自助提交的）：这个 IP 能访问本机**所有端口**（`ufw allow from <ip>`）。
+- **开放端口**：这个 TCP 端口对**任何来源**开放（`ufw allow <port>/tcp`）。
 
-Single binary, Go standard library only (no external dependencies). **Linux +
-ufw only** — it shells out to `ufw` and reads `/proc/net/nf_conntrack`.
+三个页面/行为：
 
-## 一键部署（推荐）
+- **用户页 `/`**：自动识别访客 IP 并显示出来，点确认就放行该 IP（全端口）。
+- **管理台 `/admin`**（密码保护）：设置对外开放的端口、管理固定 IP 白名单、查看和撤销当前放行的 IP。
+- **空闲回收**：用户自助放行的 IP，如果 **48 小时内没有任何连接**，就连同它的防火墙规则一起删除。
+  固定 IP 不会过期。
 
-在目标服务器（Debian 12/13、Ubuntu 24.04+ 等，需 root 与 ufw）上执行：
+## 一键部署
+
+目标机器需要 root 和 ufw（Debian 12/13、Ubuntu 24.04+ 之类都行）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh | sudo bash
 ```
 
-脚本会：识别 CPU 架构 → 下载最新 Release 二进制并校验 → 安装到
-`/usr/local/bin/portknock`（并安装管理命令 `portknock-ctl`）→ **预置默认开放端口
-`80, 443, 22, 222`** → **自动放行本机 SSH 端口**（防锁死，见下）→ 生成随机
-**管理密码**和 **API 密钥**（存入 `/etc/portknock.env`，权限 600）→ 注册并启动
-systemd 服务。完成后终端会打印密码和访问地址。重复执行即原地升级（状态与密码保留）。
+脚本做这些事：按 CPU 架构下载最新 Release 二进制并校验 → 装到 `/usr/local/bin/portknock`
+（同时装一个管理命令 `portknock-ctl`）→ 预置默认开放端口 `80, 443, 22, 222` →
+自动放行 SSH 端口防止把自己锁在外面 → 生成随机的**管理密码**和 **API 密钥**
+（写进 `/etc/portknock.env`，权限 600）→ 注册并启动 systemd 服务。装完会在终端打印密码和访问地址。
+重复执行就是原地升级，状态和密码都保留。
 
-**默认开放端口**：首次安装会写入初始 `state.json`，预置开放 `80, 443, 22, 222`
-（对所有 IP 开放）。可用 `PORTKNOCK_DEFAULT_PORTS="80 443"` 覆盖。已存在的
-`state.json` 不会被覆盖，之后随时可在管理台增删。
+本地直接跑 `sudo portknock-ctl`（不带参数）会进一个交互菜单，首次安装也可以走里面的引导向导，
+一步步问你监听地址、端口、SSH 口、是否反代。
 
-**SSH 防锁死**：安装时自动下发一条 `ufw allow 22/tcp` 规则，带
-`portknock-install:` 注释，**独立于应用状态**——这是**唯一**管理界面删不掉、
-也不会被规则重建清除的端口，用来保证你永远能 SSH 进来。其余端口（含预置的
-80 / 443 / 222）都是普通可删端口，随时可在管理台增删。覆盖受保护端口用
-`PORTKNOCK_SSH_PORT=2222`，完全跳过用 `PORTKNOCK_NO_SSH=1`。
+### 默认开放端口
 
-> 若你的 sshd 实际监听的不是 22，安装时会提示——此时 22 的兜底规则保护不到你，
-> 请把真实端口也设为受保护（`PORTKNOCK_SSH_PORT=<真实端口>`）或手动放行。
+首次安装会写一个初始 `state.json`，预置开放 `80, 443, 22, 222`（对所有 IP）。
+想换用 `PORTKNOCK_DEFAULT_PORTS="80 443"`。已经存在的 `state.json` 不会被覆盖，之后都在管理台里改。
+
+### SSH 防锁死
+
+安装时会单独下一条放行 SSH 的规则（默认 22，会自动探测你 sshd 实际监听的端口，比如 222）。
+这条规则带 `portknock-install:` 注释，**独立于应用状态**——管理台删不掉、也不会被规则重建清掉，
+就是为了保证你任何时候都能 SSH 进来。其余端口（包括预置的 80/443/222）都是普通端口，随时能删。
+想改受保护的端口用 `PORTKNOCK_SSH_PORT=2222`，完全不要这条规则用 `PORTKNOCK_NO_SSH=1`。
 
 ### 监听地址与端口
 
-默认只监听 `127.0.0.1:8080`（仅本机可达，外部访问不到）。用
-`PORTKNOCK_LISTEN=地址:端口` 自定义，例如：
+默认只监听 `127.0.0.1:8080`，也就是只有本机能连，外面访问不到。用 `PORTKNOCK_LISTEN` 改：
 
 ```sh
-# 对外监听（任意网卡），用 http://服务器IP:8080/ 访问
+# 对外监听，之后用 http://服务器IP:8080/ 访问
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
   | sudo PORTKNOCK_LISTEN=0.0.0.0:8080 bash
 
-# 换一个端口（比如 8080 被占用时）
+# 换端口（比如 8080 被占了）
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
   | sudo PORTKNOCK_LISTEN=0.0.0.0:8888 bash
 ```
 
-安装时若检测到该端口已被其它进程占用，会给出提醒并建议换端口（重装 portknock
-自身不会误报）。
+安装时如果发现端口被别的进程占了会提示你换一个。
 
-**对外监听（`0.0.0.0`）的注意事项：**
-- 需要放行该端口（在管理台把它加入开放端口，或先 `sudo ufw allow 8080/tcp`），
-  否则 ufw 启用后会把管理口也挡掉。
-- 是明文 HTTP：登录密码、API 密钥在网络上明文传输，公网环境有被嗅探风险。
-- 用户页对公网开放意味着任何人都能打开它放行自己的 IP——面向公众时应配合口令或
-  仅给可信网络访问。
+对外监听（`0.0.0.0`）之前想清楚几点：这个端口得自己放行（管理台加进开放端口，或先
+`sudo ufw allow 8080/tcp`），否则 ufw 一开就把管理口也挡了；而且是明文 HTTP，
+密码和 API 密钥都走明文；用户页对公网开放意味着任何人都能打开它放行自己，面向公众时最好加口令或只给可信网络。
 
-**不想对外、只自己管理？用 SSH 隧道最安全**（保持默认 `127.0.0.1:8080` 不改）：
+只想自己偶尔管一下、不想暴露端口的话，**SSH 隧道最省心**（保持默认 `127.0.0.1:8080` 不动）：
 
 ```sh
-# 本地执行（-p 换成你的 SSH 端口，如 222），然后浏览器开 http://localhost:8080
+# 本地执行，-p 换成你的 SSH 端口，然后浏览器开 http://localhost:8080
 ssh -L 8080:127.0.0.1:8080 -p 222 root@服务器IP
 ```
 
-> 生产环境建议仍监听本地，前面用 nginx/Caddy 终止 TLS 反代（见下一节），尤其是 `/admin`。
+### 管理命令 `portknock-ctl`
 
-### 管理命令（`portknock-ctl`）
-
-安装后本地可直接调用（或远程 `curl ... | sudo bash -s -- <命令>`）：
+装好后本地直接用，远程也能 `curl ... | sudo bash -s -- <命令>`：
 
 | 命令 | 作用 |
 |------|------|
-| `sudo portknock-ctl`（无参数） | 打开交互菜单 |
+| `sudo portknock-ctl` | 不带参数进交互菜单 |
 | `sudo portknock-ctl status` | 服务状态 + 白名单概览 |
-| `sudo portknock-ctl urls` | 打印访问链接 + 可直接运行的 API 示例 |
-| `sudo portknock-ctl creds` | 打印管理密码 / API 密钥 |
-| `sudo portknock-ctl reset-password` | 重新生成密码与密钥并重启 |
+| `sudo portknock-ctl urls` | 打印访问链接和能直接跑的 API 示例 |
+| `sudo portknock-ctl creds` | 看管理密码 / API 密钥 |
+| `sudo portknock-ctl reset-password` | 重新生成密码和密钥并重启 |
 | `sudo portknock-ctl update` | 原地升级到最新 Release |
-| `sudo portknock-ctl logs` | 实时跟随日志 |
-| `sudo portknock-ctl restart` | 重启服务 |
+| `sudo portknock-ctl logs` | 跟随日志 |
+| `sudo portknock-ctl restart` | 重启 |
 | `sudo portknock-ctl backup [文件]` | 备份 `state.json` |
 | `sudo portknock-ctl restore <文件>` | 从备份恢复并重启 |
-| `sudo portknock-ctl uninstall [--purge]` | 卸载（`--purge` 连状态、密钥、install 的 SSH 规则一起删） |
+| `sudo portknock-ctl uninstall [--purge]` | 卸载（`--purge` 连状态、密钥、SSH 规则一起删） |
 
-## 反向代理与真实客户端 IP（重要）
+## 反向代理和真实 IP
 
-portknock 靠**来访 IP** 判断放行谁。是否需要 `--trust-proxy`，取决于你怎么对外暴露：
+portknock 靠访客 IP 决定放行谁，所以要不要开 `--trust-proxy`，取决于你怎么暴露它。
 
-**情况一：直连，无反代**（直接访问 `http://服务器IP:端口`）
-- **不要**启用 `PORTKNOCK_TRUST_PROXY`。安装结尾那句"反代：未启用…"直接忽略。
-- 启用了反而危险：没有可信代理在前面时，任何人都能伪造 `X-Forwarded-For`
-  头来放行任意 IP。
+**直连、没有反代**（直接开 `http://服务器IP:端口`）：别开 `PORTKNOCK_TRUST_PROXY`，
+装完那句"反代：未启用"忽略即可。这种情况下开了反而危险——没有可信代理挡在前面时，
+任何人都能伪造 `X-Forwarded-For` 来放行任意 IP。
 
-**情况二：前面有 nginx/Caddy 反代**
-- 不设 `--trust-proxy` 的话，portknock 只会看到反代的 `127.0.0.1`，所有访客
-  都被当成同一个 IP，放行功能失效。
-- 需要**两边都配**：
-
-1）重装 portknock 并启用信任代理（会保留状态与密码）：
+**前面有 nginx/Caddy**：不开 `--trust-proxy` 的话，portknock 只看得到反代的 `127.0.0.1`，
+所有访客都变成同一个 IP，放行就失效了。这时候两边都要配。先重装并打开信任代理（状态和密码会保留）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
   | sudo PORTKNOCK_TRUST_PROXY=1 bash
 ```
 
-（这会给服务加 `--trust-proxy`，并因反代通常终止 HTTPS 而加 `--secure-cookie=true`。）
-
-2）nginx 必须传真实 IP 头（关键是 `X-Forwarded-For`）：
+nginx 这边要把真实 IP 透传过来，关键是 `X-Forwarded-For`：
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name portknock.example.com;        # 改成你的域名
+    server_name portknock.example.com;        # 换成你的域名
     ssl_certificate     /etc/letsencrypt/live/portknock.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/portknock.example.com/privkey.pem;
 
@@ -145,79 +129,47 @@ server {
 }
 ```
 
-**安全前提**：启用 `--trust-proxy` 时，portknock 必须只监听本地
-（`--listen 127.0.0.1:8080`，即默认值），确保唯一入口是反代。否则有人能绕过
-nginx 直连 8080 并伪造 `X-Forwarded-For`。portknock 取的是 `X-Forwarded-For`
-的**最后一跳**，配合 nginx 的 `$proxy_add_x_forwarded_for` 既拿到真实 IP 又防伪造。
+开了 `--trust-proxy` 就一定要让 portknock 只监听本地（默认的 `127.0.0.1:8080`），
+保证唯一入口是反代，否则有人绕过 nginx 直连 8080 伪造头照样能骗过去。portknock 取的是
+`X-Forwarded-For` 的**最后一跳**，配合 nginx 的 `$proxy_add_x_forwarded_for`，既拿到真实 IP 又防伪造。
 
-验证真实 IP 是否生效：打开用户页，看"检测到的来访 IP"是否是你的真实公网 IP
-（而不是 `127.0.0.1`）。
+想确认生效没：打开用户页，看"检测到的来访 IP"是不是你真实的公网 IP，而不是 `127.0.0.1`。
 
-## Install a prebuilt binary manually (no Go needed)
+### HTTPS 与 Secure cookie
 
-Each `v*` git tag triggers a GitHub Actions release with static Linux binaries.
-Download, verify, and run — no toolchain required:
+`--secure-cookie` 默认**关**，而且和 `--trust-proxy` 相互独立——"有反代"不等于"走 HTTPS"。
+只有确实通过 `https://` 访问时才加 `PORTKNOCK_SECURE_COOKIE=1`：
 
 ```sh
-curl -fsSL -o portknock \
-  https://github.com/huya1121/portknock/releases/latest/download/portknock-linux-amd64
-chmod +x portknock
-sudo PORTKNOCK_ADMIN_PASS='your-strong-password' ./portknock --listen 127.0.0.1:8080
+curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
+  | sudo PORTKNOCK_TRUST_PROXY=1 PORTKNOCK_SECURE_COOKIE=1 bash
 ```
 
-(arm64 binary is published too: `portknock-linux-arm64`.)
+如果在明文 HTTP 下开了 Secure cookie，浏览器会丢掉登录/CSRF 的 cookie，表现就是
+**登录之后立刻跳回登录页**，很像密码错了。遇到这种情况先把它关掉。
 
-## Build from source
+## 管理台里有什么
 
-```sh
-go build -o portknock .
-```
-
-Cross-compiling from another OS (e.g. the Windows dev box):
-
-```sh
-GOOS=linux GOARCH=amd64 go build -o portknock .
-```
-
-## Run
-
-ufw requires root, so the service runs as root.
-
-```sh
-sudo PORTKNOCK_ADMIN_PASS='your-strong-password' ./portknock \
-    --listen 127.0.0.1:8080 \
-    --state /var/lib/portknock/state.json \
-    --expiry 48h --poll 2m
-```
-
-Make sure ufw itself is enabled (`sudo ufw enable`) and that your base policy
-allows the service in — e.g. keep SSH open with your own rule so you don't lock
-yourself out.
-
-### Flags
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--listen` | `:8080` | HTTP listen address |
-| `--state` | `/var/lib/portknock/state.json` | state file path |
-| `--admin-pass` | — | admin password (or env `PORTKNOCK_ADMIN_PASS`) |
-| `--trust-proxy` | `false` | honor last `X-Forwarded-For` hop (set **only** behind a trusted reverse proxy) |
-| `--poll` | `2m` | conntrack poll interval |
-| `--expiry` | `48h` | idle-expiry window for dynamic IPs |
-| `--dry-run` | `false` | log ufw commands instead of executing them (test without ufw) |
-| `--secure-cookie` | `true` | set `Secure` on the session cookie (disable only for local HTTP testing) |
-| `--api-key` | — | bearer token for the JSON API (or env `PORTKNOCK_API_KEY`); empty disables the API |
+- **概览**：开放端口 / 固定 IP / 动态 IP 的数量，一眼看到。
+- **防火墙总开关**：规则配错把自己挡外面时的紧急逃生——一键 `ufw disable` 让所有端口恢复可达，
+  排障完再一键启用。
+- **IPv6 开关**：切换 ufw 管不管 IPv6。受控时 IPv6 和 IPv4 一样走白名单；放开则 ufw 不碰 IPv6、
+  所有 IPv6 端口直通（改 `/etc/default/ufw` 并 reload，有二次确认）。
+- **自我锁定提醒**：当前 IP 不在固定白名单时会提示你，并给个"把我加进固定白名单"的快捷按钮，
+  免得规则过期后进不来。
+- **规则预览确认**：改端口、增删 IP、撤销之前，会弹窗显示当前 ufw 规则和这次会增删哪些，确认了才真正下发。
+- **本地时间 + 空闲预警**：放行时间按本地时区显示，空闲时长超过回收窗口 60% 变黄、90% 变红。
+- **自动刷新 + 移动端适配**：页面每 30 秒刷新空闲状态（输入时暂停），窄屏下表格变成卡片。
 
 ## JSON API
 
-When `--api-key` (or `PORTKNOCK_API_KEY`) is set, a programmatic grant endpoint
-is enabled for scripts / CI / home routers:
+设了 `--api-key`（或环境变量 `PORTKNOCK_API_KEY`）就会开一个放行接口，方便脚本 / CI / 家里路由器调用：
 
 ```sh
-# grant the caller's own IP
+# 放行调用方自己的 IP
 curl -X POST https://host/api/grant -H "Authorization: Bearer $PORTKNOCK_API_KEY"
 
-# grant a specific IP
+# 放行指定 IP
 curl -X POST https://host/api/grant \
      -H "Authorization: Bearer $PORTKNOCK_API_KEY" \
      -H "Content-Type: application/json" \
@@ -225,83 +177,112 @@ curl -X POST https://host/api/grant \
 # -> {"ip":"203.0.113.9","status":"granted"}
 ```
 
-Granted IPs are dynamic — same all-port access and same 48h idle expiry as the
-web page. The token is compared in constant time; the endpoint returns 404 when
-no key is configured.
+通过 API 放行的 IP 也是动态的，和网页放行一样全端口、48 小时空闲回收。密钥是常量时间比较的；
+没配密钥时这个接口返回 404。
 
-## Admin console features
+## 手动安装（不装 Go）
 
-- **Overview** — counts of open ports / fixed IPs / dynamic IPs at a glance.
-- **Self-lockout guard** — warns when your current IP isn't in the fixed
-  whitelist (so an expiring/removed rule could lock you out), with a one-click
-  "add my IP as fixed" shortcut.
-- **Humanized times** — grant/last-seen shown in local time; idle duration turns
-  amber past 60% of the expiry window and red past 90%.
-- **Rule-preview confirmation** — every change (save ports, add/remove fixed IP,
-  revoke) first shows a modal with the current ufw rules plus the exact rules
-  that would be added / deleted; nothing is written to ufw until you confirm.
-  Backed by `GET /admin/preview` (read-only, auth required), which computes the
-  diff via `Firewall.Preview` without touching the firewall.
-- **Auto-refresh** — the page refreshes idle status every 30s (paused while you
-  type), and is fully responsive on mobile (tables become stacked cards).
+每打一个 `v*` tag，GitHub Actions 就会编译出静态 Linux 二进制。直接下载就能跑：
 
-## How it works
+```sh
+curl -fsSL -o portknock \
+  https://github.com/huya1121/portknock/releases/latest/download/portknock-linux-amd64
+chmod +x portknock
+sudo PORTKNOCK_ADMIN_PASS='你的强密码' ./portknock --listen 127.0.0.1:8080
+```
 
-- **State** (`store.go`) is a JSON file: `ports`, `fixed_ips`, and `dynamic`
-  (each with `added_at` / `last_seen`). It is the single source of truth; writes
-  are atomic (temp file + rename).
-- **Firewall** (`firewall.go`) wraps ufw. Every managed rule carries a comment:
-  `portknock:dyn:<ip>` / `portknock:fixed:<ip>` for all-port IP grants
-  (`ufw allow from <ip>`), and `portknock:port:<port>` for public ports
-  (`ufw allow <port>/tcp`). Changing ports or the IP lists triggers a full
-  reconcile: purge all `portknock:` rules, then re-add from state. ufw is invoked
-  with an argument slice (never a shell string).
-- **Janitor** (`janitor.go`) polls `/proc/net/nf_conntrack` every `--poll`. Any
-  live connection whose source is a dynamic IP refreshes that IP's `last_seen`
-  (since dynamic IPs have all-port access, destination port is not filtered). Any
-  dynamic IP idle longer than `--expiry` is revoked.
+arm64 也有：`portknock-linux-arm64`。
 
-### Caveat: connection detection
+## 从源码编译
 
-Activity is sampled from conntrack on an interval, so a connection that both opens
-and closes entirely between two polls can be missed. Over a 48h window this is
-immaterial — a genuinely active IP appears across many polls. If the conntrack
-table isn't readable (nf_conntrack module not loaded), the service logs a warning
-and falls back to pure time-based expiry (48h from grant / last refresh), so it
-still works, just without activity-based renewal.
+```sh
+go build -o portknock .
+# 交叉编译 Linux 版：
+GOOS=linux GOARCH=amd64 go build -o portknock .
+```
 
-## Security notes
+## 参数
 
-- Runs as root (ufw requirement). Bind to localhost and front it with a reverse
-  proxy that terminates TLS, especially for `/admin`.
-- Client IP comes from the TCP peer by default. `X-Forwarded-For` is trusted
-  **only** with `--trust-proxy`; enabling it without a trusted proxy in front lets
-  anyone whitelist an arbitrary IP via a spoofed header.
-- Admin auth is a single password (constant-time compared) with an in-memory
-  session cookie (`HttpOnly`, `Secure`, `SameSite=Strict`) and per-session CSRF
-  tokens on all state-changing POSTs.
-- The public `/grant` form is CSRF-protected too, via a double-submit token
-  (`HttpOnly`, `SameSite=Strict` cookie that the form value must match), so a
-  cross-site page can't silently whitelist a visitor's IP.
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--listen` | `:8080` | 监听地址 |
+| `--state` | `/var/lib/portknock/state.json` | 状态文件路径 |
+| `--admin-pass` | — | 管理密码（或环境变量 `PORTKNOCK_ADMIN_PASS`） |
+| `--trust-proxy` | `false` | 信任 `X-Forwarded-For` 最后一跳（**仅**在可信反代后面开） |
+| `--poll` | `2m` | conntrack 轮询间隔 |
+| `--expiry` | `48h` | 动态 IP 的空闲回收窗口 |
+| `--dry-run` | `false` | 只打印 ufw 命令不执行（无 ufw 环境下测试用） |
+| `--secure-cookie` | `false` | 给 cookie 加 Secure，**仅** HTTPS 下开（明文 HTTP 下开了会登不上） |
+| `--api-key` | — | JSON API 的 bearer token（或 `PORTKNOCK_API_KEY`），空则关闭 API |
 
-## Test
+## 实现大概
+
+- **状态**（`store.go`）是一个 JSON 文件，记 `ports` / `fixed_ips` / `dynamic`，是唯一事实来源；
+  写入用临时文件加 rename，保证原子。
+- **防火墙**（`firewall.go`）包一层 ufw。每条规则都带注释：IP 放行是 `portknock:dyn:<ip>` /
+  `portknock:fixed:<ip>`（`ufw allow from <ip>`），开放端口是 `portknock:port:<port>`。
+  改动时做 diff，只加缺的、只删多余的，保留的规则不动，避免访问中断。
+- **回收**（`janitor.go`）按 `--poll` 读 conntrack，任何来自动态 IP 的连接都刷新它的 last_seen；
+  空闲超过 `--expiry` 就撤销。IPv6 地址会规范化后再比对，避免展开/压缩格式不一致导致误删。
+
+conntrack 是定时采样的，所以两次采样之间开了又关的连接可能漏掉——但在 48 小时的尺度下无所谓，
+真正活跃的 IP 会在很多次采样里出现。如果内核没加载 conntrack 模块，会退化成纯计时（从放行/上次刷新算 48 小时）。
+
+## 安全说明
+
+- 以 root 运行（ufw 要求）。建议只监听本地，前面用反代终止 TLS，管理台尤其如此。
+- 默认取 TCP 对端地址当客户端 IP。`X-Forwarded-For` 只在 `--trust-proxy` 下才信；
+  没有可信反代就开，等于让人随便伪造头放行任意 IP。
+- 管理密码常量时间比较，session 存在进程内存里（cookie 带 `HttpOnly` / `SameSite=Strict`），
+  所有改状态的 POST 都带 CSRF token。
+- 用户页 `/grant` 也有 CSRF 保护（双重提交 token），避免别的网站偷偷让访客放行自己。
+
+## 测试
 
 ```sh
 go test ./...
 ```
 
-Unit tests cover conntrack parsing, state round-trip + expiry, ufw rule
-construction/parsing, and client-IP extraction.
+覆盖 conntrack 解析、状态读写与过期、ufw 规则构造/解析、客户端 IP 提取等。
 
-## systemd
+---
 
-See [`portknock.service`](portknock.service). Install the binary to
-`/usr/local/bin/portknock`, edit the password, then:
+# portknock (English)
+
+A tiny Go service that lets a visitor whitelist their own IP in the host's ufw
+firewall from a web page, while an admin controls which ports are open and which
+IPs are permanently trusted. Single static binary, standard library only,
+**Linux + ufw only**.
+
+**Access model** — two independent rule families: a whitelisted IP (fixed or
+user-submitted) reaches *all* ports (`ufw allow from <ip>`); a whitelisted port
+is open to *any* source (`ufw allow <port>/tcp`). User-submitted IPs expire after
+48h with no connection activity; fixed IPs never do.
+
+**Install:**
 
 ```sh
-sudo cp portknock /usr/local/bin/
-sudo cp portknock.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now portknock
+curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh | sudo bash
 ```
+
+Downloads the latest release binary, seeds default open ports `80,443,22,222`,
+keeps SSH reachable to avoid lockout, generates an admin password + API key in
+`/etc/portknock.env`, and starts a systemd service. Manage it later with
+`sudo portknock-ctl` (run with no args for an interactive menu). Override the
+listen address with `PORTKNOCK_LISTEN=0.0.0.0:8080`.
+
+**Behind a reverse proxy:** reinstall with `PORTKNOCK_TRUST_PROXY=1` so the real
+client IP is read from the last `X-Forwarded-For` hop, and have nginx set that
+header. Keep portknock bound to localhost. Add `PORTKNOCK_SECURE_COOKIE=1` only
+when actually served over HTTPS — a Secure cookie on plain HTTP breaks login.
+
+**Flags:** `--listen`, `--state`, `--admin-pass`, `--trust-proxy`, `--poll`,
+`--expiry`, `--dry-run`, `--secure-cookie`, `--api-key` (see the Chinese table
+above for defaults and meaning).
+
+**JSON API:** with `--api-key` set, `POST /api/grant` with
+`Authorization: Bearer <key>` grants the caller's IP (or `{"ip":"..."}`).
+
+Build from source: `go build -o portknock .` (cross-compile with
+`GOOS=linux GOARCH=amd64`). Run `go test ./...` for the unit tests.
 

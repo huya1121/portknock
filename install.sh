@@ -44,6 +44,11 @@ LISTEN="${PORTKNOCK_LISTEN:-127.0.0.1:8080}"
 # trusted proxy is actually in front AND portknock listens on localhost, or
 # anyone could spoof the header to whitelist arbitrary IPs.
 TRUST_PROXY="${PORTKNOCK_TRUST_PROXY:-0}"
+# Set PORTKNOCK_SECURE_COOKIE=1 ONLY when portknock is reached over HTTPS (e.g.
+# a reverse proxy that terminates TLS). Default off: browsers drop a Secure
+# cookie on plain HTTP, which would break login / the CSRF-protected grant form.
+# This is independent of TRUST_PROXY — having a proxy does not imply HTTPS.
+SECURE_COOKIE="${PORTKNOCK_SECURE_COOKIE:-0}"
 # Keep SSH reachable so enabling/using ufw can't lock you out. Set
 # PORTKNOCK_SSH_PORT to override detection; set PORTKNOCK_NO_SSH=1 to skip.
 SSH_PORT="${PORTKNOCK_SSH_PORT:-}"
@@ -169,6 +174,11 @@ EOF
   else
     echo "  反代：    未启用。若前面有 nginx/Caddy，请用 PORTKNOCK_TRUST_PROXY=1 重装，否则只会看到代理 IP"
   fi
+  if [ "$SECURE_COOKIE" = "1" ]; then
+    echo "  Cookie：  Secure 已开（仅 HTTPS 下可登录；若用 http:// 访问会登不上）"
+  else
+    echo "  Cookie：  Secure 关闭（HTTP 可正常登录）。上了 HTTPS 再用 PORTKNOCK_SECURE_COOKIE=1 开启"
+  fi
   echo
   echo "以后可用： sudo portknock-ctl status | creds | update | uninstall | logs"
 }
@@ -243,10 +253,12 @@ allow_ssh() {
 
 write_service() {
   local extra=""
-  # A reverse proxy implies HTTPS is terminated in front, so mark cookies Secure.
-  # Plain-HTTP installs leave Secure off, or browsers would drop the CSRF/session
-  # cookie and every form POST would fail.
-  [ "$TRUST_PROXY" = "1" ] && extra=" --trust-proxy --secure-cookie=true"
+  # trust-proxy and secure-cookie are independent: a proxy doesn't imply HTTPS.
+  # Only mark cookies Secure when explicitly told we're served over HTTPS,
+  # otherwise browsers drop the session/CSRF cookie on plain HTTP and login
+  # (and the grant form) silently fail.
+  [ "$TRUST_PROXY" = "1" ] && extra="${extra} --trust-proxy"
+  [ "$SECURE_COOKIE" = "1" ] && extra="${extra} --secure-cookie=true"
   cat > "$SERVICE" <<EOF
 [Unit]
 Description=portknock - web-based ufw IP whitelist

@@ -164,6 +164,80 @@ func (f *Firewall) IsActive() bool {
 	return strings.Contains(out, "Status: active")
 }
 
+// defaultUFWFile is where ufw keeps the IPV6=yes/no toggle.
+const defaultUFWFile = "/etc/default/ufw"
+
+// IPv6Managed reports whether ufw is configured to manage IPv6 (IPV6=yes).
+// When false, ufw ignores IPv6 entirely and all IPv6 ports are reachable.
+func (f *Firewall) IPv6Managed() bool {
+	if f.dryRun {
+		return true
+	}
+	data, err := os.ReadFile(defaultUFWFile)
+	if err != nil {
+		return true // assume managed (ufw default) if unreadable
+	}
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "IPV6="); ok {
+			v = strings.Trim(strings.TrimSpace(v), `"'`)
+			return !strings.EqualFold(v, "no")
+		}
+	}
+	return true
+}
+
+// SetIPv6Managed switches ufw's IPV6 setting in /etc/default/ufw and reloads so
+// it takes effect. managed=true → IPv6 obeys the whitelist like IPv4;
+// managed=false → ufw ignores IPv6 (all IPv6 ports open). Reload re-applies the
+// current state's rules.
+func (f *Firewall) SetIPv6Managed(managed bool, st State) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dryRun {
+		log.Printf("[dry-run] set %s IPV6=%s + ufw reload", defaultUFWFile, boolYesNo(managed))
+		return nil
+	}
+	data, err := os.ReadFile(defaultUFWFile)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", defaultUFWFile, err)
+	}
+	want := "IPV6=" + boolYesNo(managed)
+	lines := strings.Split(string(data), "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "IPV6=") {
+			lines[i] = want
+			replaced = true
+		}
+	}
+	if !replaced {
+		lines = append(lines, want)
+	}
+	out := strings.Join(lines, "\n")
+	if err := os.WriteFile(defaultUFWFile, []byte(out), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", defaultUFWFile, err)
+	}
+	// Reload only matters when ufw is active; --force avoids prompts.
+	if _, err := f.run("reload"); err != nil {
+		// reload fails if ufw is inactive; not fatal — the setting is saved and
+		// applies on next enable.
+		log.Printf("ufw reload after IPv6 change: %v (saved, applies on enable)", err)
+	}
+	return f.reconcileLocked(st)
+}
+
+func boolYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
 // ReconcileAll makes ufw match the given state exactly. It holds the ufw lock
 // for the whole operation and applies changes "add-before-delete": rules that
 // should still exist are never removed, so a currently-whitelisted IP keeps

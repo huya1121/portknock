@@ -103,6 +103,7 @@ func main() {
 	mux.HandleFunc("/admin/revoke", srv.handleRevoke)
 	mux.HandleFunc("/admin/preview", srv.handlePreview)
 	mux.HandleFunc("/admin/firewall", srv.handleFirewall)
+	mux.HandleFunc("/admin/ipv6", srv.handleIPv6Toggle)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 
 	log.Printf("portknock %s listening on %s (dry-run=%v, expiry=%s, poll=%s, api=%v)", version, cfg.Listen, cfg.DryRun, cfg.Expiry, cfg.Poll, cfg.APIKey != "")
@@ -310,7 +311,8 @@ type adminData struct {
 	NumPorts   int
 	NumFixed   int
 	NumDynamic int
-	FWActive   bool // whether ufw is currently enabled
+	FWActive    bool // whether ufw is currently enabled
+	IPv6Managed bool // whether ufw manages IPv6 (IPV6=yes)
 }
 
 type fixedView struct {
@@ -413,7 +415,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		NumPorts:   len(st.Ports),
 		NumFixed:   len(st.FixedIPs),
 		NumDynamic: len(st.Dynamic),
-		FWActive:   s.fw.IsActive(),
+		FWActive:    s.fw.IsActive(),
+		IPv6Managed: s.fw.IPv6Managed(),
 	})
 }
 
@@ -655,6 +658,23 @@ func (s *Server) handleFirewall(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown action", http.StatusBadRequest)
 		return
 	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleIPv6Toggle switches whether ufw manages IPv6 (controls /etc/default/ufw
+// IPV6=yes/no, then reloads). POST managed=1 → IPv6 goes through the whitelist
+// like IPv4; managed=0 → ufw ignores IPv6 entirely (all IPv6 ports wide open).
+func (s *Server) handleIPv6Toggle(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	managed := r.FormValue("managed") == "1"
+	if err := s.fw.SetIPv6Managed(managed, s.store.Snapshot()); err != nil {
+		log.Printf("set ipv6 managed=%v: %v", managed, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("ufw IPv6 managed = %v (from admin panel)", managed)
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 

@@ -19,3 +19,4 @@ jobs:
         run: go test ./...
       - name: Build (sanity)
         run: go build -o /dev/null .
+

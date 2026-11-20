@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -109,14 +110,36 @@ func readFirst(paths []string) (string, error) {
 // A conntrack line contains space-separated key=value tokens, e.g.:
 //   ipv4 2 tcp 6 431999 ESTABLISHED src=1.2.3.4 dst=10.0.0.1 sport=5000 dport=80 ...
 // The first src= on the line is the originating source (the client connecting in).
+//
+// IMPORTANT: conntrack writes IPv6 addresses zero-padded and fully expanded
+// (src=240b:4009:0254:d800:...), while our stored dynamic IPs are in Go's
+// canonical form (zeros stripped, :: compressed). A plain string compare would
+// never match, so both sides are normalized through net.ParseIP before
+// comparison. dyn keys are expected to already be canonical (store side), but
+// we canonicalize here too for safety.
 func activeIPs(conntrack string, dyn map[string]bool) map[string]bool {
+	// Build a canonical lookup of the dynamic IPs.
+	canonDyn := make(map[string]bool, len(dyn))
+	for ip := range dyn {
+		if p := net.ParseIP(ip); p != nil {
+			canonDyn[p.String()] = true
+		} else {
+			canonDyn[ip] = true
+		}
+	}
 	active := map[string]bool{}
 	sc := bufio.NewScanner(strings.NewReader(conntrack))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
 		src := firstValue(line, "src=")
-		if src != "" && dyn[src] {
+		if src == "" {
+			continue
+		}
+		if p := net.ParseIP(src); p != nil {
+			src = p.String() // normalize conntrack's expanded form
+		}
+		if canonDyn[src] {
 			active[src] = true
 		}
 	}
@@ -136,3 +159,4 @@ func firstValue(line, key string) string {
 	}
 	return rest
 }
+

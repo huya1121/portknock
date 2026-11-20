@@ -208,6 +208,29 @@
 
   <div class="card">
     <h2>
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M4 12h16M12 4c2.5 2.5 2.5 13 0 16M12 4c-2.5 2.5-2.5 13 0 16" stroke="currentColor" stroke-width="1.3"/></svg>
+      IPv6 防火墙{{if .IPv6Managed}}<span class="pill perm">受控（同 IPv4）</span>{{else}}<span class="pill world">已放开（全通）</span>{{end}}
+    </h2>
+    <p class="desc"><strong>受控</strong>：IPv6 和 IPv4 一样走白名单，只有开放端口/放行 IP 能通。
+      <strong>放开</strong>：ufw 不再管 IPv6，所有 IPv6 端口对全球开放、无防护。
+      切换会修改 <code>/etc/default/ufw</code> 并 reload。</p>
+    {{if .IPv6Managed}}
+    <form method="post" action="/admin/ipv6" onsubmit="return confirm('确定放开 IPv6？\n\nufw 将不再管控 IPv6，本机所有 IPv6 端口（含 SSH、数据库等）对全球开放、无任何防护。\n\n确认继续？');">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="managed" value="0">
+      <button class="btn danger" type="submit">放开 IPv6（取消管控）</button>
+    </form>
+    {{else}}
+    <form method="post" action="/admin/ipv6" onsubmit="return confirm('恢复 IPv6 管控？IPv6 将和 IPv4 一样走白名单。');">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="managed" value="1">
+      <button class="btn" type="submit">恢复 IPv6 管控（同 IPv4）</button>
+    </form>
+    {{end}}
+  </div>
+
+  <div class="card">
+    <h2>
       <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h18" stroke="currentColor" stroke-width="1.6"/></svg>
       对外开放端口<span class="pill world">所有人可访问</span>
     </h2>
