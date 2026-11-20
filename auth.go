@@ -111,3 +111,4 @@ func (a *Auth) Logout(r *http.Request) {
 	delete(a.sessions, c.Value)
 	a.mu.Unlock()
 }
+

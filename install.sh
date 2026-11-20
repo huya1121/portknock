@@ -56,6 +56,28 @@ need_root() { [ "$(id -u)" -eq 0 ] || die "请用 root 运行（sudo）。"; }
 
 gen_secret() { head -c "${1:-18}" /dev/urandom | base64 | tr -d '/+=' | cut -c1-"${2:-24}"; }
 
+# check_port warns if the configured LISTEN port is already in use by a process
+# other than portknock itself (so re-installs/upgrades don't false-alarm).
+check_port() {
+  local port="${LISTEN##*:}"
+  case "$port" in (*[!0-9]*|'') return;; esac
+  local line=""
+  if command -v ss >/dev/null 2>&1; then
+    line="$(ss -ltnp 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p')"
+  elif command -v netstat >/dev/null 2>&1; then
+    line="$(netstat -ltnp 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p')"
+  else
+    return  # no tool to check; skip quietly
+  fi
+  [ -z "$line" ] && return
+  # Ignore if it's our own service already listening (upgrade case).
+  printf '%s' "$line" | grep -q 'portknock' && return
+  warn "端口 ${port} 似乎已被占用："
+  printf '    %s\n' "$line" >&2
+  warn "若非 portknock，启动可能失败。可用 PORTKNOCK_LISTEN=地址:端口 换一个端口重装，例如："
+  warn "    curl -fsSL .../install.sh | sudo PORTKNOCK_LISTEN=0.0.0.0:8888 bash"
+}
+
 # --- install / update -------------------------------------------------------
 
 cmd_install() {
@@ -125,6 +147,7 @@ EOF
 
   seed_state
   allow_ssh
+  check_port
 
   write_service
   say "注册并启动服务 ..."
@@ -416,6 +439,58 @@ run_cmd() {
 # installed reports whether portknock is already installed on this host.
 installed() { [ -f "$BIN_PATH" ] && [ -f "$SERVICE" ]; }
 
+# ask prints a prompt (with a default shown) and reads an answer, echoing the
+# default when the user just presses enter.
+ask() {
+  local prompt="$1" def="$2" ans
+  printf '%s [%s]: ' "$prompt" "$def"
+  read -r ans || ans=""
+  echo "${ans:-$def}"
+}
+
+# install_wizard interactively collects config, then runs cmd_install with the
+# answers exported as the same env vars the piped installer honors. Used by the
+# menu's "install" entry so first-time setup is guided.
+install_wizard() {
+  echo
+  say "安装向导（直接回车用方括号内的默认值）"
+  echo "  ----------------------------------------"
+
+  # 1) 对外还是仅本机
+  local scope host
+  echo "  监听范围：1) 仅本机 127.0.0.1（最安全，需 SSH 隧道/反代访问）"
+  echo "            2) 对外 0.0.0.0（可用 http://服务器IP 直接访问）"
+  scope="$(ask "  选择 1 或 2" "1")"
+  case "$scope" in
+    2) host="0.0.0.0" ;;
+    *) host="127.0.0.1" ;;
+  esac
+
+  # 2) 端口
+  local port; port="$(ask "  监听端口" "8080")"
+  case "$port" in (*[!0-9]*|'') warn "端口无效，用 8080。"; port=8080 ;; esac
+  export PORTKNOCK_LISTEN="${host}:${port}"
+
+  # 3) SSH 端口（防锁死保护口，默认自动探测）
+  local detected; detected="$(detect_ssh_port)"
+  local sshp; sshp="$(ask "  受防锁死保护的 SSH 端口" "$detected")"
+  [ "$sshp" != "$detected" ] && export PORTKNOCK_SSH_PORT="$sshp"
+
+  # 4) 反代
+  local proxy; proxy="$(ask "  是否在 nginx/Caddy 反代后面？(y/N)" "N")"
+  case "$proxy" in
+    y|Y) export PORTKNOCK_TRUST_PROXY=1 ;;
+  esac
+
+  echo "  ----------------------------------------"
+  say "即将安装：监听 ${PORTKNOCK_LISTEN}  SSH保护 ${sshp}  反代 ${PORTKNOCK_TRUST_PROXY:-0}"
+  local go; go="$(ask "  确认开始？(Y/n)" "Y")"
+  case "$go" in
+    n|N) warn "已取消。"; return 0 ;;
+  esac
+  cmd_install
+}
+
 # menu shows an interactive menu (only on a real terminal with no subcommand).
 menu() {
   while true; do
@@ -430,7 +505,7 @@ menu() {
       echo "  状态：未安装"
     fi
     echo "  --------------------------------------"
-    echo "   1) 安装 / 升级"
+    echo "   1) 引导安装 / 升级"
     echo "   2) 查看状态与白名单概览"
     echo "   3) 查看访问链接 / API 调用示例"
     echo "   4) 查看管理密码 / API 密钥"
@@ -445,7 +520,7 @@ menu() {
     printf "请选择 [0-10]: "
     local choice; read -r choice || { echo; return 0; }
     case "$choice" in
-      1) run_cmd install ;;
+      1) install_wizard ;;
       2) run_cmd status ;;
       3) run_cmd urls ;;
       4) run_cmd creds ;;

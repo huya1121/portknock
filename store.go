@@ -211,3 +211,4 @@ func (s *Store) TouchAndExpire(active map[string]bool, window time.Duration, now
 	}
 	return expired, nil
 }
+

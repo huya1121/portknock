@@ -104,3 +104,4 @@ func TestPreviewDryRun(t *testing.T) {
 		t.Errorf("expected 0 deletes, got %v", del)
 	}
 }
+

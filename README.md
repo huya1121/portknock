@@ -51,14 +51,39 @@ systemd 服务。完成后终端会打印密码和访问地址。重复执行即
 > 若你的 sshd 实际监听的不是 22，安装时会提示——此时 22 的兜底规则保护不到你，
 > 请把真实端口也设为受保护（`PORTKNOCK_SSH_PORT=<真实端口>`）或手动放行。
 
-默认只监听 `127.0.0.1:8080`。要对外监听：
+### 监听地址与端口
+
+默认只监听 `127.0.0.1:8080`（仅本机可达，外部访问不到）。用
+`PORTKNOCK_LISTEN=地址:端口` 自定义，例如：
 
 ```sh
+# 对外监听（任意网卡），用 http://服务器IP:8080/ 访问
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
   | sudo PORTKNOCK_LISTEN=0.0.0.0:8080 bash
+
+# 换一个端口（比如 8080 被占用时）
+curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
+  | sudo PORTKNOCK_LISTEN=0.0.0.0:8888 bash
 ```
 
-> 生产环境建议仍监听本地，前面用 nginx/Caddy 终止 TLS 反代，尤其是 `/admin`。
+安装时若检测到该端口已被其它进程占用，会给出提醒并建议换端口（重装 portknock
+自身不会误报）。
+
+**对外监听（`0.0.0.0`）的注意事项：**
+- 需要放行该端口（在管理台把它加入开放端口，或先 `sudo ufw allow 8080/tcp`），
+  否则 ufw 启用后会把管理口也挡掉。
+- 是明文 HTTP：登录密码、API 密钥在网络上明文传输，公网环境有被嗅探风险。
+- 用户页对公网开放意味着任何人都能打开它放行自己的 IP——面向公众时应配合口令或
+  仅给可信网络访问。
+
+**不想对外、只自己管理？用 SSH 隧道最安全**（保持默认 `127.0.0.1:8080` 不改）：
+
+```sh
+# 本地执行（-p 换成你的 SSH 端口，如 222），然后浏览器开 http://localhost:8080
+ssh -L 8080:127.0.0.1:8080 -p 222 root@服务器IP
+```
+
+> 生产环境建议仍监听本地，前面用 nginx/Caddy 终止 TLS 反代（见下一节），尤其是 `/admin`。
 
 ### 管理命令（`portknock-ctl`）
 
@@ -66,7 +91,9 @@ curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh 
 
 | 命令 | 作用 |
 |------|------|
+| `sudo portknock-ctl`（无参数） | 打开交互菜单 |
 | `sudo portknock-ctl status` | 服务状态 + 白名单概览 |
+| `sudo portknock-ctl urls` | 打印访问链接 + 可直接运行的 API 示例 |
 | `sudo portknock-ctl creds` | 打印管理密码 / API 密钥 |
 | `sudo portknock-ctl reset-password` | 重新生成密码与密钥并重启 |
 | `sudo portknock-ctl update` | 原地升级到最新 Release |
@@ -75,6 +102,56 @@ curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh 
 | `sudo portknock-ctl backup [文件]` | 备份 `state.json` |
 | `sudo portknock-ctl restore <文件>` | 从备份恢复并重启 |
 | `sudo portknock-ctl uninstall [--purge]` | 卸载（`--purge` 连状态、密钥、install 的 SSH 规则一起删） |
+
+## 反向代理与真实客户端 IP（重要）
+
+portknock 靠**来访 IP** 判断放行谁。是否需要 `--trust-proxy`，取决于你怎么对外暴露：
+
+**情况一：直连，无反代**（直接访问 `http://服务器IP:端口`）
+- **不要**启用 `PORTKNOCK_TRUST_PROXY`。安装结尾那句"反代：未启用…"直接忽略。
+- 启用了反而危险：没有可信代理在前面时，任何人都能伪造 `X-Forwarded-For`
+  头来放行任意 IP。
+
+**情况二：前面有 nginx/Caddy 反代**
+- 不设 `--trust-proxy` 的话，portknock 只会看到反代的 `127.0.0.1`，所有访客
+  都被当成同一个 IP，放行功能失效。
+- 需要**两边都配**：
+
+1）重装 portknock 并启用信任代理（会保留状态与密码）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh \
+  | sudo PORTKNOCK_TRUST_PROXY=1 bash
+```
+
+（这会给服务加 `--trust-proxy`，并因反代通常终止 HTTPS 而加 `--secure-cookie=true`。）
+
+2）nginx 必须传真实 IP 头（关键是 `X-Forwarded-For`）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name portknock.example.com;        # 改成你的域名
+    ssl_certificate     /etc/letsencrypt/live/portknock.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/portknock.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+**安全前提**：启用 `--trust-proxy` 时，portknock 必须只监听本地
+（`--listen 127.0.0.1:8080`，即默认值），确保唯一入口是反代。否则有人能绕过
+nginx 直连 8080 并伪造 `X-Forwarded-For`。portknock 取的是 `X-Forwarded-For`
+的**最后一跳**，配合 nginx 的 `$proxy_add_x_forwarded_for` 既拿到真实 IP 又防伪造。
+
+验证真实 IP 是否生效：打开用户页，看"检测到的来访 IP"是否是你的真实公网 IP
+（而不是 `127.0.0.1`）。
 
 ## Install a prebuilt binary manually (no Go needed)
 
@@ -227,3 +304,4 @@ sudo cp portknock.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now portknock
 ```
+
