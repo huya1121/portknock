@@ -190,10 +190,12 @@ detect_ssh_port() {
   echo "${p:-22}"
 }
 
-# protected_ssh_port prints the single SSH port guarded against lockout: 22 by
-# default (override with PORTKNOCK_SSH_PORT). This is the ONLY port the installer
-# makes undeletable; all other ports (80/443/222/…) are normal, deletable.
-protected_ssh_port() { echo "${SSH_PORT:-22}"; }
+# protected_ssh_port prints the single SSH port guarded against lockout. It
+# follows the actually-detected sshd port (PORTKNOCK_SSH_PORT override > live
+# sshd config > sshd_config > 22), so a non-standard SSH port is protected
+# automatically. This is the ONLY port the installer makes undeletable; all
+# other ports are normal and deletable from the panel.
+protected_ssh_port() { detect_ssh_port; }
 
 # allow_ssh opens the protected SSH port to any source with an install-managed
 # ufw rule. The comment prefix is "portknock-install:" (NOT "portknock:"), so the
@@ -203,12 +205,6 @@ allow_ssh() {
   command -v ufw >/dev/null 2>&1 || { warn "无 ufw，跳过 SSH 放行。"; return; }
   local p; p="$(protected_ssh_port)"
   case "$p" in (*[!0-9]*|'') warn "SSH 端口异常（$p），跳过。"; return;; esac
-
-  # If sshd actually listens elsewhere, 22 alone may not protect you — warn.
-  local real; real="$(detect_ssh_port)"
-  if [ "$real" != "$p" ]; then
-    warn "检测到 sshd 实际端口为 ${real}，但防锁死规则只保护 ${p}。如需保护 ${real}，请手动： ufw allow ${real}/tcp"
-  fi
 
   local status; status="$(ufw status 2>/dev/null || true)"
   if printf '%s' "$status" | grep -q "portknock-install:ssh:${p}\b"; then
