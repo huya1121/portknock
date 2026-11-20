@@ -161,6 +161,7 @@ EOF
 
   seed_state
   allow_ssh
+  allow_listen_port
   check_port
 
   write_service
@@ -257,6 +258,30 @@ allow_ssh() {
     say "已放行 SSH 端口 ${p}/tcp（防锁死，管理台删不掉）。"
   else
     warn "放行 SSH 端口 ${p} 失败，请手动执行： ufw allow ${p}/tcp"
+  fi
+}
+
+# allow_listen_port opens the web listen port when portknock binds to a public
+# address, so enabling ufw doesn't block the panel itself. Uses an install-
+# managed rule (comment "portknock-install:listen:<port>") so it survives
+# upgrades and the panel can't delete it. Skipped for localhost binds (reached
+# via SSH tunnel or a reverse proxy, which needs 80/443 instead).
+allow_listen_port() {
+  command -v ufw >/dev/null 2>&1 || return
+  local host="${LISTEN%:*}" port="${LISTEN##*:}"
+  case "$host" in
+    127.0.0.1|localhost|::1|"") return ;;  # local-only: no rule needed
+  esac
+  case "$port" in (*[!0-9]*|'') return;; esac
+  local status; status="$(ufw status 2>/dev/null || true)"
+  if printf '%s' "$status" | grep -q "portknock-install:listen:${port}\b"; then
+    say "监听端口 ${port} 已放行。"
+    return
+  fi
+  if ufw allow "${port}/tcp" comment "portknock-install:listen:${port}" >/dev/null 2>&1; then
+    say "已放行管理监听端口 ${port}/tcp（对外访问用，管理台删不掉）。"
+  else
+    warn "放行监听端口 ${port} 失败，请手动执行： ufw allow ${port}/tcp"
   fi
 }
 
@@ -425,11 +450,16 @@ cmd_uninstall() {
   rm -f "$BIN_PATH" "$CTL_PATH"
   if [ "$purge" = "1" ]; then
     rm -rf "$STATE_DIR"; rm -f "$ENV_FILE"
-    # Remove our install-managed SSH rule (purge means remove everything we added).
+    # Remove our install-managed rules (purge means remove everything we added):
+    # the SSH lockout-guard and any listen-port rule, found by their comments.
     if command -v ufw >/dev/null 2>&1; then
       ufw delete allow "$(protected_ssh_port)/tcp" >/dev/null 2>&1 || true
+      local lp
+      for lp in $(ufw status 2>/dev/null | awk '/portknock-install:listen:/{split($1,a,"/"); print a[1]}' | sort -u); do
+        ufw delete allow "${lp}/tcp" >/dev/null 2>&1 || true
+      done
     fi
-    say "已彻底卸载（含状态、密钥与 install 放行的 SSH 规则）。"
+    say "已彻底卸载（含状态、密钥与 install 放行的 SSH / 监听端口规则）。"
     warn "注意：应用运行期下发的 portknock: 规则不由本脚本清理；如需检查请看 'ufw status'。"
   else
     say "已卸载二进制与服务。状态 ${STATE_DIR} 与配置 ${ENV_FILE} 已保留（加 --purge 可一并删除）。"
