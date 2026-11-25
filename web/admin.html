@@ -80,6 +80,10 @@
     border:1px solid var(--card-br); border-radius:11px; outline:none; transition:border-color .15s, box-shadow .15s;
   }
   input[type=text]:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  /* Flexible inputs inside a .row: grow but never force the row wider than the
+     viewport (min-width:0 lets them shrink; they wrap to full width on mobile). */
+  .grow1 { flex:1 1 180px; min-width:0; }
+  .grow2 { flex:2 1 220px; min-width:0; }
   .btn {
     font-size:.93rem; font-weight:600; padding:.6rem 1.15rem; border:0; border-radius:11px; color:#fff;
     cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent2));
@@ -107,6 +111,11 @@
   .apibox { font-family:ui-monospace,"SF Mono",monospace; font-size:.82rem; line-height:1.5;
     background:rgba(255,255,255,.04); border:1px solid var(--card-br); border-radius:10px;
     padding:.8rem .9rem; overflow-x:auto; white-space:pre; color:var(--fg); margin:.3rem 0 0; }
+
+  /* key/value field (label above, value below; value wraps — good on mobile) */
+  .kv { margin:.5rem 0; }
+  .kv .k { color:var(--muted); font-size:.78rem; margin-bottom:.15rem; }
+  .kv .v { word-break:break-all; font-size:.9rem; }
 
   .banner {
     display:flex; gap:.6rem; align-items:flex-start; background:rgba(251,191,36,.12);
@@ -144,13 +153,19 @@
   /* Mobile: stack stats, turn tables into cards, full-width controls */
   @media (max-width:560px) {
     body { padding:1.5rem .9rem 3rem; }
+    .wrap { max-width:100%; }
     .stats { grid-template-columns:1fr 1fr 1fr; gap:.55rem; }
     .stat { padding:.7rem .6rem; border-radius:13px; }
     .stat .n { font-size:1.4rem; }
     .stat .l { font-size:.72rem; }
     .card { padding:1.15rem 1.1rem; border-radius:15px; }
-    .row input[type=text] { flex:1 1 100%; min-width:0; }
-    .row .btn { flex:1 1 100%; }
+    .card h2 { font-size:1rem; }
+
+    /* every control in a .row goes full width and stacks */
+    .row { flex-direction:column; align-items:stretch; }
+    .row input[type=text], .row .btn, .row .grow1, .row .grow2 {
+      flex:1 1 auto; width:100%; min-width:0;
+    }
 
     /* table -> stacked cards */
     table, thead, tbody, tr, td { display:block; width:100%; }
@@ -158,13 +173,23 @@
     tr { border:1px solid var(--card-br); border-radius:12px; padding:.6rem .8rem; margin-bottom:.7rem;
       background:rgba(255,255,255,.03); }
     tr:last-child { margin-bottom:0; }
-    td { border:0; padding:.2rem 0; display:flex; justify-content:space-between; gap:1rem; }
-    td::before { content:attr(data-label); color:var(--muted); font-size:.78rem; }
+    td { border:0; padding:.25rem 0; display:flex; justify-content:space-between; align-items:baseline;
+      gap:.75rem; min-width:0; }
+    td::before { content:attr(data-label); color:var(--muted); font-size:.78rem; flex:none; }
+    /* long values (IP / key / URL) wrap instead of overflowing */
+    td.mono, td.ipcell { word-break:break-all; text-align:right; }
     td:last-child { margin-top:.5rem; }
-    td .btn { width:100%; }
-    td.ipcell { font-size:1.02rem; font-weight:600; }
+    td .btn, td form, td form .btn { width:100%; }
+    td.ipcell { font-size:1rem; font-weight:600; text-align:left; }
     td.ipcell::before { content:""; }
+    /* key/value rows (API card): label above, value below, both left-aligned */
+    td[style*="nowrap"] { white-space:normal !important; }
     .empty { text-align:center; }
+    .empty::before { content:""; }
+
+    /* API example code box: wrap long curl lines, don't force horizontal scroll */
+    .apibox { white-space:pre-wrap; word-break:break-all; font-size:.76rem; padding:.7rem .75rem; }
+    .chips { gap:.35rem; }
   }
 </style>
 </head>
@@ -268,8 +293,8 @@
     <form method="post" action="/admin/children" class="row">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="action" value="add">
-      <input type="text" name="url" placeholder="http://10.0.0.11:8080" required style="flex:2; min-width:220px;">
-      <input type="text" name="key" placeholder="该节点的 API 密钥" required style="flex:1; min-width:160px;">
+      <input type="text" name="url" placeholder="https://10.0.0.11:8080" required class="grow2">
+      <input type="text" name="key" placeholder="该节点的 API 密钥" required class="grow1">
       <button class="btn" type="submit">添加</button>
     </form>
     <table>
@@ -300,19 +325,15 @@
     </h2>
     {{if .APIKey}}
     <p class="desc">脚本 / CI / 路由器可以用这个接口放行 IP（也用于子节点同步）。密钥如下，请妥善保管。</p>
-    <table>
-      <tbody>
-        <tr><td style="color:var(--muted);white-space:nowrap">接口地址</td><td class="mono">{{.APIBase}}/api/grant</td></tr>
-        <tr><td style="color:var(--muted);white-space:nowrap">API 密钥</td><td class="mono" style="word-break:break-all">{{.APIKey}}</td></tr>
-      </tbody>
-    </table>
-    <p class="desc" style="margin-top:.9rem">调用示例：</p>
+    <div class="kv"><div class="k">接口地址</div><div class="v mono">{{.APIBase}}/api/grant</div></div>
+    <div class="kv"><div class="k">API 密钥</div><div class="v mono">{{.APIKey}}</div></div>
+    <p class="desc" style="margin-top:.9rem">调用示例（<code>-k</code> 因证书自签）：</p>
     <pre class="apibox"># 放行调用方自己的 IP
-curl -X POST {{.APIBase}}/api/grant \
+curl -k -X POST {{.APIBase}}/api/grant \
      -H "Authorization: Bearer {{.APIKey}}"
 
 # 放行指定 IP
-curl -X POST {{.APIBase}}/api/grant \
+curl -k -X POST {{.APIBase}}/api/grant \
      -H "Authorization: Bearer {{.APIKey}}" \
      -H "Content-Type: application/json" \
      -d '{"ip":"203.0.113.9"}'</pre>
@@ -331,7 +352,7 @@ curl -X POST {{.APIBase}}/api/grant \
     <p class="desc">这些 TCP 端口对<strong>任意 IP</strong> 开放。用逗号或空格分隔端口号。</p>
     <form method="post" action="/admin/ports" class="row pk-form" data-action="ports" data-value-field="ports" data-title="保存开放端口">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <input type="text" name="ports" value="{{.PortsStr}}" placeholder="例如 80, 443" inputmode="numeric" style="flex:1; min-width:240px;">
+      <input type="text" name="ports" value="{{.PortsStr}}" placeholder="例如 80, 443" inputmode="numeric" class="grow1">
       <button class="btn" type="submit">保存</button>
     </form>
     {{if .Ports}}<div class="chips">{{range .Ports}}<span class="chip">{{.}}/tcp</span>{{end}}</div>{{end}}
@@ -346,7 +367,7 @@ curl -X POST {{.APIBase}}/api/grant \
     <form method="post" action="/admin/fixed" class="row pk-form" data-action="fixed-add" data-value-field="ip" data-title="添加固定白名单 IP">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="action" value="add">
-      <input type="text" name="ip" placeholder="例如 203.0.113.5" required style="flex:1; min-width:240px;">
+      <input type="text" name="ip" placeholder="例如 203.0.113.5" required class="grow1">
       <button class="btn" type="submit">添加</button>
     </form>
     {{if not .FixedIPs}}
