@@ -76,23 +76,26 @@ gen_secret() { head -c "${1:-18}" /dev/urandom | base64 | tr -d '/+=' | cut -c1-
 ensure_ufw() {
   command -v ufw >/dev/null 2>&1 && return
   say "未检测到 ufw，尝试自动安装 ..."
+  # Run the install under `|| true` so a package-manager failure (e.g. no
+  # network) falls through to the friendly check below instead of aborting
+  # abruptly under `set -e`.
   if command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update -y && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || true
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ufw
+    dnf install -y ufw || true
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ufw
+    yum install -y ufw || true
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install ufw
+    zypper --non-interactive install ufw || true
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm ufw
+    pacman -Sy --noconfirm ufw || true
   elif command -v apk >/dev/null 2>&1; then
-    apk add ufw
+    apk add ufw || true
   else
     die "无法自动安装 ufw：未识别的包管理器，请手动安装后重试。"
   fi
-  command -v ufw >/dev/null 2>&1 || die "ufw 安装后仍未找到，请手动检查。"
+  command -v ufw >/dev/null 2>&1 || die "ufw 自动安装失败（可能无网络或源问题），请手动安装后重试。"
   say "ufw 已安装。"
 }
 
@@ -529,12 +532,26 @@ run_cmd() {
 # installed reports whether portknock is already installed on this host.
 installed() { [ -f "$BIN_PATH" ] && [ -f "$SERVICE" ]; }
 
+# read_tty reads one line from the terminal and prints it. In a piped install
+# (curl | bash) the shell's stdin is the script text, so reads must come from
+# /dev/tty to reach the keyboard; when there's no tty, fall back to stdin.
+read_tty() {
+  local ans
+  if [ -r /dev/tty ]; then
+    read -r ans </dev/tty || return 1
+  else
+    read -r ans || return 1
+  fi
+  printf '%s' "$ans"
+}
+
 # ask prints a prompt (with a default shown) and reads an answer, echoing the
-# default when the user just presses enter.
+# default when the user just presses enter. The caller captures the answer with
+# $(...), so the prompt must go to stderr — otherwise it'd be swallowed.
 ask() {
   local prompt="$1" def="$2" ans
-  printf '%s [%s]: ' "$prompt" "$def"
-  read -r ans || ans=""
+  printf '%s [%s]: ' "$prompt" "$def" >&2
+  ans="$(read_tty)" || ans=""
   echo "${ans:-$def}"
 }
 
@@ -608,7 +625,14 @@ menu() {
     echo "   0) 退出"
     echo "  --------------------------------------"
     printf "请选择 [0-10]: "
-    local choice; read -r choice || { echo; return 0; }
+    # Read from the terminal (stdin is the script text under curl|bash). A failed
+    # read means EOF/closed tty — leave the menu instead of looping forever.
+    local choice
+    if [ -r /dev/tty ]; then
+      read -r choice </dev/tty || { echo; return 0; }
+    else
+      read -r choice || { echo; return 0; }
+    fi
     case "$choice" in
       1) install_wizard ;;
       2) run_cmd status ;;
@@ -619,12 +643,12 @@ menu() {
       7) run_cmd restart ;;
       8) run_cmd backup ;;
       9)
-        printf "请输入备份文件路径: "; local f; read -r f
+        printf "请输入备份文件路径: "; local f; f="$(read_tty)"
         [ -n "${f:-}" ] && run_cmd restore "$f" || warn "未输入路径，已取消。"
         ;;
       10)
         printf "确认卸载？彻底删除(含状态与密钥)请输入 purge，仅卸载请输入 y，其它取消: "
-        local c; read -r c
+        local c; c="$(read_tty)"
         case "$c" in
           purge) run_cmd uninstall --purge ;;
           y|Y)   run_cmd uninstall ;;
@@ -634,7 +658,7 @@ menu() {
       0) echo "再见。"; return 0 ;;
       *) warn "无效选择：$choice" ;;
     esac
-    printf "\n按回车返回菜单..."; read -r _ || return 0
+    printf "\n按回车返回菜单..."; read_tty >/dev/null || return 0
   done
 }
 
