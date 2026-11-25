@@ -219,6 +219,14 @@
   @media (max-width:560px) {
     body { padding:1.25rem .8rem 3rem; }
     .wrap { max-width:100%; }
+    /* Topbar on narrow screens: two rows — brand (with role badge) on top, the
+       theme/logout buttons on their own row below, right-aligned. Everything can
+       shrink/wrap so nothing overflows off-screen. */
+    .topbar { flex-wrap:wrap; gap:.5rem .6rem; align-items:flex-start; }
+    .brand { flex:1 1 100%; flex-wrap:wrap; font-size:1.05rem; gap:.35rem .5rem; min-width:0; }
+    .brand svg { width:24px; height:24px; }
+    .brand .dot { font-size:.85rem; }
+    .topbar > div:last-child { flex:1 1 100%; justify-content:flex-end; }
     .tabs { gap:.35rem; position:sticky; top:0; z-index:10; padding:.5rem 0;
       background:linear-gradient(180deg, var(--bg0) 70%, transparent); margin:0 0 1rem; }
     .tab-btn { flex:1 1 40%; text-align:center; padding:.55rem .5rem; }
@@ -238,6 +246,9 @@
     .row input[type=text], .row .btn, .row .grow1, .row .grow2 {
       width:100%; min-width:0; flex:0 0 auto;
     }
+    /* 模式选择器：短按钮保持横排（可换行），不竖直撑满。 */
+    .row.modebar { flex-direction:row; flex-wrap:wrap; align-items:center; }
+    .row.modebar .btn, .row.modebar .ghost { width:auto; flex:0 1 auto; }
 
     /* 表格 → 卡片：每行一张小卡，字段左对齐两行式（标签在上、值在下） */
     table, tbody, tr, td { display:block; width:100%; }
@@ -386,7 +397,7 @@
       <strong>子节点</strong>：只接收上游推送，隐藏中心控制菜单、并停止向下游同步。
       {{if eq .NodeMode ""}}当前为<strong>自动</strong>模式{{if .HasUpstream}}（已检测到上游推送，按子节点处理）{{else}}（未检测到上游，按中心处理）{{end}}。{{end}}
     </p>
-    <form method="post" action="/admin/node-mode" class="row">
+    <form method="post" action="/admin/node-mode" class="row modebar">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button class="{{if eq .NodeMode ""}}btn{{else}}ghost{{end}}" type="submit" name="mode" value="">自动</button>
       <button class="{{if eq .NodeMode "center"}}btn{{else}}ghost{{end}}" type="submit" name="mode" value="center">强制中心</button>
@@ -887,3 +898,4 @@ curl -k -X POST {{.APIBase}}/api/grant \
 </script>
 </body>
 </html>
+
