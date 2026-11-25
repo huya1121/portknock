@@ -44,11 +44,9 @@ LISTEN="${PORTKNOCK_LISTEN:-127.0.0.1:8080}"
 # trusted proxy is actually in front AND portknock listens on localhost, or
 # anyone could spoof the header to whitelist arbitrary IPs.
 TRUST_PROXY="${PORTKNOCK_TRUST_PROXY:-0}"
-# Set PORTKNOCK_SECURE_COOKIE=1 ONLY when portknock is reached over HTTPS (e.g.
-# a reverse proxy that terminates TLS). Default off: browsers drop a Secure
-# cookie on plain HTTP, which would break login / the CSRF-protected grant form.
-# This is independent of TRUST_PROXY — having a proxy does not imply HTTPS.
-SECURE_COOKIE="${PORTKNOCK_SECURE_COOKIE:-0}"
+# Optional shared password for the user page: when set, visitors must enter it
+# before their IP is granted. Empty = no gate (anyone who opens the page can grant).
+GRANT_PASS="${PORTKNOCK_GRANT_PASSWORD:-}"
 # Keep SSH reachable so enabling/using ufw can't lock you out. Set
 # PORTKNOCK_SSH_PORT to override detection; set PORTKNOCK_NO_SSH=1 to skip.
 SSH_PORT="${PORTKNOCK_SSH_PORT:-}"
@@ -126,6 +124,12 @@ check_port() {
 cmd_install() {
   need_root
   command -v systemctl >/dev/null 2>&1 || die "需要 systemd（systemctl 未找到）。"
+  # Re-resolve here too: the install wizard exports these AFTER the top-level
+  # assignment ran, so pick up anything it set.
+  TRUST_PROXY="${PORTKNOCK_TRUST_PROXY:-$TRUST_PROXY}"
+  GRANT_PASS="${PORTKNOCK_GRANT_PASSWORD:-$GRANT_PASS}"
+  SSH_PORT="${PORTKNOCK_SSH_PORT:-$SSH_PORT}"
+  LISTEN="${PORTKNOCK_LISTEN:-$LISTEN}"
   ensure_ufw
 
   if command -v ufw >/dev/null 2>&1; then
@@ -188,6 +192,13 @@ EOF
     say "沿用已有配置：${ENV_FILE}"
   fi
 
+  # If a user-page password was provided, set/replace it in the env file.
+  if [ -n "$GRANT_PASS" ]; then
+    sed -i '/^PORTKNOCK_GRANT_PASSWORD=/d' "$ENV_FILE"
+    printf 'PORTKNOCK_GRANT_PASSWORD=%s\n' "$GRANT_PASS" >> "$ENV_FILE"
+    say "已设置用户页放行口令。"
+  fi
+
   seed_state
   allow_ssh
   allow_listen_port
@@ -209,18 +220,19 @@ EOF
   if [ "$newcreds" != "1" ]; then
     echo "  （以上为已有密码，本次升级未改动；如需更换用 ${SUDO}portknock-ctl reset-password）"
   fi
-  echo "  用户页：  http://${LISTEN}/"
-  echo "  管理台：  http://${LISTEN}/admin"
+  echo "  用户页：  https://${LISTEN}/"
+  echo "  管理台：  https://${LISTEN}/admin"
+  echo "  （HTTPS 自签证书，浏览器会提示不安全，点“继续/高级→仍然访问”即可）"
   echo "  SSH：     已放行 $(protected_ssh_port)/tcp（防锁死，仅此端口管理台删不掉）"
   if [ "$TRUST_PROXY" = "1" ]; then
     echo "  反代：    已启用 --trust-proxy（从 X-Forwarded-For 读取真实客户端 IP）"
   else
     echo "  反代：    未启用。若前面有 nginx/Caddy，请用 PORTKNOCK_TRUST_PROXY=1 重装，否则只会看到代理 IP"
   fi
-  if [ "$SECURE_COOKIE" = "1" ]; then
-    echo "  Cookie：  Secure 已开（仅 HTTPS 下可登录；若用 http:// 访问会登不上）"
+  if [ -n "$GRANT_PASS" ]; then
+    echo "  用户口令：已设置（访客需输入口令才能放行）"
   else
-    echo "  Cookie：  Secure 关闭（HTTP 可正常登录）。上了 HTTPS 再用 PORTKNOCK_SECURE_COOKIE=1 开启"
+    echo "  用户口令：未设置（任何人打开用户页即可放行自己）。可用 PORTKNOCK_GRANT_PASSWORD=... 重装开启"
   fi
   echo
   echo "管理命令（直接运行 ${SUDO}portknock-ctl 不带参数可进交互菜单）："
@@ -329,12 +341,8 @@ allow_listen_port() {
 
 write_service() {
   local extra=""
-  # trust-proxy and secure-cookie are independent: a proxy doesn't imply HTTPS.
-  # Only mark cookies Secure when explicitly told we're served over HTTPS,
-  # otherwise browsers drop the session/CSRF cookie on plain HTTP and login
-  # (and the grant form) silently fail.
+  # Behind a reverse proxy, read the real client IP from X-Forwarded-For.
   [ "$TRUST_PROXY" = "1" ] && extra="${extra} --trust-proxy"
-  [ "$SECURE_COOKIE" = "1" ] && extra="${extra} --secure-cookie=true"
   cat > "$SERVICE" <<EOF
 [Unit]
 Description=portknock - web-based ufw IP whitelist
@@ -387,7 +395,7 @@ effective_listen() {
 # cmd_urls prints the access URLs and a ready-to-run API example (with key).
 cmd_urls() {
   need_root
-  local listen host port scheme base apikey
+  local listen host port base apikey
   listen="$(effective_listen)"
   host="${listen%:*}"; port="${listen##*:}"
   # A bind on 0.0.0.0/:: is reachable via the machine's public IP; 127.0.0.1 is
@@ -395,9 +403,7 @@ cmd_urls() {
   case "$host" in
     0.0.0.0|""|"::") host="<服务器IP或域名>" ;;
   esac
-  scheme="http"
-  grep -q -- '--secure-cookie=true' "$SERVICE" 2>/dev/null && scheme="https"
-  base="${scheme}://${host}:${port}"
+  base="https://${host}:${port}"   # service is HTTPS-only
 
   echo "  用户提交页： ${base}/"
   echo "  管理控制台： ${base}/admin"
@@ -405,22 +411,19 @@ cmd_urls() {
   if [ -f "$ENV_FILE" ]; then
     apikey="$(grep PORTKNOCK_API_KEY "$ENV_FILE" | cut -d= -f2-)"
   fi
+  # -k because the cert is self-signed.
   if [ -n "${apikey:-}" ]; then
     echo "  API 提交（放行调用方自己的 IP）："
-    echo "    curl -X POST ${base}/api/grant \\"
+    echo "    curl -k -X POST ${base}/api/grant \\"
     echo "         -H \"Authorization: Bearer ${apikey}\""
     echo
     echo "  API 提交（放行指定 IP）："
-    echo "    curl -X POST ${base}/api/grant \\"
+    echo "    curl -k -X POST ${base}/api/grant \\"
     echo "         -H \"Authorization: Bearer ${apikey}\" \\"
     echo "         -H \"Content-Type: application/json\" \\"
     echo "         -d '{\"ip\":\"203.0.113.9\"}'"
   else
     warn "未找到 API 密钥（${ENV_FILE}）；API 可能未配置。"
-  fi
-  if [ "$scheme" = "http" ] && [ "$host" != "127.0.0.1" ]; then
-    echo
-    warn "当前为明文 HTTP。生产环境建议前置 nginx/Caddy 终止 HTTPS，并用 PORTKNOCK_TRUST_PROXY=1 重装。"
   fi
 }
 
@@ -566,7 +569,7 @@ install_wizard() {
   # 1) 对外还是仅本机
   local scope host
   echo "  监听范围：1) 仅本机 127.0.0.1（最安全，需 SSH 隧道/反代访问）"
-  echo "            2) 对外 0.0.0.0（可用 http://服务器IP 直接访问）"
+  echo "            2) 对外 0.0.0.0（可用 https://服务器IP 直接访问）"
   scope="$(ask "  选择 1 或 2" "1")"
   case "$scope" in
     2) host="0.0.0.0" ;;
@@ -588,6 +591,10 @@ install_wizard() {
   case "$proxy" in
     y|Y) export PORTKNOCK_TRUST_PROXY=1 ;;
   esac
+
+  # 5) 用户页放行口令（可选，回车跳过 = 无门槛）
+  local gp; gp="$(ask "  用户页放行口令（留空=任何人可放行）" "")"
+  [ -n "$gp" ] && export PORTKNOCK_GRANT_PASSWORD="$gp"
 
   echo "  ----------------------------------------"
   say "即将安装：监听 ${PORTKNOCK_LISTEN}  SSH保护 ${sshp}  反代 ${PORTKNOCK_TRUST_PROXY:-0}"

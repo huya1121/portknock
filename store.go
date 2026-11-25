@@ -17,12 +17,20 @@ type Dynamic struct {
 	LastSeen time.Time `json:"last_seen"`
 }
 
+// Child is a downstream portknock node this one fans grants out to. URL is the
+// base address (e.g. "http://10.0.0.11:8080"); Key is that node's API key.
+type Child struct {
+	URL string `json:"url"`
+	Key string `json:"key"`
+}
+
 // State is the full persisted state of the service. It is the single source of
 // truth; the firewall is reconciled to match it.
 type State struct {
 	Ports    []int     `json:"ports"`     // whitelisted TCP ports
 	FixedIPs []string  `json:"fixed_ips"` // permanent whitelist
 	Dynamic  []Dynamic `json:"dynamic"`   // user-submitted, idle-expiry applies
+	Children []Child   `json:"children"`  // downstream nodes to fan grants out to
 }
 
 // Store guards State with a mutex and persists it atomically to disk.
@@ -55,6 +63,9 @@ func NewStore(path string) (*Store, error) {
 	if s.state.Dynamic == nil {
 		s.state.Dynamic = []Dynamic{}
 	}
+	if s.state.Children == nil {
+		s.state.Children = []Child{}
+	}
 	return s, nil
 }
 
@@ -70,6 +81,7 @@ func (s *Store) copyLocked() State {
 		Ports:    append([]int(nil), s.state.Ports...),
 		FixedIPs: append([]string(nil), s.state.FixedIPs...),
 		Dynamic:  append([]Dynamic(nil), s.state.Dynamic...),
+		Children: append([]Child(nil), s.state.Children...),
 	}
 	return cp
 }
@@ -124,6 +136,34 @@ func (s *Store) SetPorts(ports []int) error {
 	return s.persistLocked()
 }
 
+// AddChild adds (or updates the key of) a downstream node, keyed by URL.
+func (s *Store) AddChild(url, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Children {
+		if s.state.Children[i].URL == url {
+			s.state.Children[i].Key = key
+			return s.persistLocked()
+		}
+	}
+	s.state.Children = append(s.state.Children, Child{URL: url, Key: key})
+	return s.persistLocked()
+}
+
+// RemoveChild removes a downstream node by URL (idempotent).
+func (s *Store) RemoveChild(url string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.state.Children[:0:0]
+	for _, c := range s.state.Children {
+		if c.URL != url {
+			out = append(out, c)
+		}
+	}
+	s.state.Children = out
+	return s.persistLocked()
+}
+
 // AddFixed adds a permanent IP (idempotent).
 func (s *Store) AddFixed(ip string) error {
 	s.mu.Lock()
@@ -152,18 +192,20 @@ func (s *Store) RemoveFixed(ip string) error {
 	return s.persistLocked()
 }
 
-// Grant adds or refreshes a dynamic IP, setting LastSeen to now.
-func (s *Store) Grant(ip string, now time.Time) error {
+// Grant adds or refreshes a dynamic IP, setting LastSeen to now. added reports
+// whether this was a new grant (true) vs. a refresh of an existing one (false),
+// so callers can skip the (idempotent) firewall call on keep-alive refreshes.
+func (s *Store) Grant(ip string, now time.Time) (added bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.state.Dynamic {
 		if s.state.Dynamic[i].IP == ip {
 			s.state.Dynamic[i].LastSeen = now
-			return s.persistLocked()
+			return false, s.persistLocked()
 		}
 	}
 	s.state.Dynamic = append(s.state.Dynamic, Dynamic{IP: ip, AddedAt: now, LastSeen: now})
-	return s.persistLocked()
+	return true, s.persistLocked()
 }
 
 // RevokeDynamic removes a dynamic IP (idempotent).

@@ -11,12 +11,20 @@ import (
 
 const sessionCookie = "portknock_session"
 
+// Brute-force limits: after maxFails failed logins from one IP within the
+// window, that IP is locked out for lockDuration.
+const (
+	maxFails     = 5
+	lockDuration = 5 * time.Minute
+)
+
 // Auth manages the single admin password and in-memory session tokens, plus a
-// per-session CSRF token.
+// per-session CSRF token and per-IP login throttling.
 type Auth struct {
 	password string
 	mu       sync.Mutex
-	sessions map[string]session // token -> session
+	sessions map[string]session  // token -> session
+	fails    map[string]failInfo // client IP -> recent failures
 	ttl      time.Duration
 }
 
@@ -25,8 +33,49 @@ type session struct {
 	expires time.Time
 }
 
+type failInfo struct {
+	count  int
+	locked time.Time // time until which the IP is locked (zero = not locked)
+}
+
 func NewAuth(password string, ttl time.Duration) *Auth {
-	return &Auth{password: password, sessions: map[string]session{}, ttl: ttl}
+	return &Auth{
+		password: password,
+		sessions: map[string]session{},
+		fails:    map[string]failInfo{},
+		ttl:      ttl,
+	}
+}
+
+// Locked reports whether ip is currently locked out, and if so for how long.
+func (a *Auth) Locked(ip string) (bool, time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	f := a.fails[ip]
+	if f.locked.IsZero() || time.Now().After(f.locked) {
+		return false, 0
+	}
+	return true, time.Until(f.locked).Round(time.Second)
+}
+
+// RecordFail notes a failed login from ip and locks it once over the threshold.
+func (a *Auth) RecordFail(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	f := a.fails[ip]
+	f.count++
+	if f.count >= maxFails {
+		f.locked = time.Now().Add(lockDuration)
+		f.count = 0 // reset counter; the lock itself now gates access
+	}
+	a.fails[ip] = f
+}
+
+// RecordSuccess clears any failure state for ip after a good login.
+func (a *Auth) RecordSuccess(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.fails, ip)
 }
 
 func randomToken() string {

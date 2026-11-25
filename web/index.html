@@ -50,6 +50,18 @@
     background:linear-gradient(135deg, rgba(109,140,255,.22), rgba(139,92,246,.22));
     border:1px solid rgba(139,92,246,.35);
   }
+  .pass {
+    width:100%; box-sizing:border-box; padding:.75rem .9rem; font-size:1rem; color:var(--fg);
+    background:rgba(255,255,255,.05); border:1px solid var(--card-br); border-radius:12px;
+    margin-bottom:.8rem; outline:none;
+  }
+  .pass:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  .err {
+    display:flex; gap:.5rem; align-items:center; color:#fecaca; background:rgba(248,113,113,.12);
+    border:1px solid rgba(248,113,113,.4); border-radius:12px; padding:.6rem .8rem;
+    margin-bottom:1rem; font-size:.9rem;
+  }
+  .err svg { width:18px; height:18px; flex:none; }
   .btn {
     width:100%; font-size:1.02rem; font-weight:650; padding:.9rem 1.4rem; border:0; border-radius:13px;
     color:#fff; cursor:pointer; letter-spacing:.3px;
@@ -88,6 +100,12 @@
       <div>已放行成功。你的 IP 现可访问本机全部端口。<br>48 小时内若无连接记录将自动移除。</div>
     </div>
     {{end}}
+    {{if eq .Error "password"}}
+    <div class="err">
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v6M12 16.5v.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      口令错误，请重试。
+    </div>
+    {{end}}
 
     <div class="iplabel">检测到的来访 IP</div>
     <div class="ipbox">
@@ -98,6 +116,9 @@
     <div class="portlabel">确认后，该 IP 将被放行访问本机<strong>全部端口</strong>。</div>
     <form method="post" action="/grant">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
+      {{if .NeedPass}}
+      <input class="pass" type="password" name="password" placeholder="请输入放行口令" autocomplete="off" required>
+      {{end}}
       <button class="btn" type="submit">放行我的 IP</button>
     </form>
   </div>

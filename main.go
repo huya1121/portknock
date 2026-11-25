@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/subtle"
+	"crypto/tls"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,16 +37,17 @@ type Config struct {
 	Poll       time.Duration
 	Expiry     time.Duration
 	DryRun     bool
-	SecureCookie bool
 	APIKey     string
+	GrantPass  string // optional password the user page requires before granting
 }
 
 // Server bundles the handlers' dependencies.
 type Server struct {
-	cfg   Config
-	store *Store
-	fw    *Firewall
-	auth  *Auth
+	cfg    Config
+	store  *Store
+	fw     *Firewall
+	auth   *Auth
+	syncer *Syncer
 }
 
 func main() {
@@ -56,8 +59,8 @@ func main() {
 	flag.DurationVar(&cfg.Poll, "poll", 2*time.Minute, "conntrack poll interval")
 	flag.DurationVar(&cfg.Expiry, "expiry", 48*time.Hour, "idle expiry window for dynamic IPs")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "log ufw commands instead of executing them")
-	flag.BoolVar(&cfg.SecureCookie, "secure-cookie", false, "set Secure flag on cookies (enable only when served over HTTPS; required cookies are dropped by browsers on plain HTTP if set)")
 	flag.StringVar(&cfg.APIKey, "api-key", "", "bearer token for the JSON API (or env PORTKNOCK_API_KEY); empty disables the API")
+	flag.StringVar(&cfg.GrantPass, "grant-pass", "", "password the user page requires before granting (or env PORTKNOCK_GRANT_PASSWORD); empty = no password")
 	flag.Parse()
 
 	if cfg.AdminPass == "" {
@@ -65,6 +68,9 @@ func main() {
 	}
 	if cfg.APIKey == "" {
 		cfg.APIKey = os.Getenv("PORTKNOCK_API_KEY")
+	}
+	if cfg.GrantPass == "" {
+		cfg.GrantPass = os.Getenv("PORTKNOCK_GRANT_PASSWORD")
 	}
 	if cfg.AdminPass == "" {
 		log.Fatal("admin password required: set --admin-pass or PORTKNOCK_ADMIN_PASS")
@@ -75,11 +81,13 @@ func main() {
 		log.Fatalf("load state: %v", err)
 	}
 	fw := NewFirewall(cfg.DryRun)
+	syncer := NewSyncer(store)
 	srv := &Server{
-		cfg:   cfg,
-		store: store,
-		fw:    fw,
-		auth:  NewAuth(cfg.AdminPass, 12*time.Hour),
+		cfg:    cfg,
+		store:  store,
+		fw:     fw,
+		auth:   NewAuth(cfg.AdminPass, 12*time.Hour),
+		syncer: syncer,
 	}
 
 	// Reconcile firewall to match persisted state at startup.
@@ -88,7 +96,7 @@ func main() {
 	}
 
 	// Start the janitor.
-	janitor := NewJanitor(store, fw, cfg.Poll, cfg.Expiry)
+	janitor := NewJanitor(store, fw, syncer, cfg.Poll, cfg.Expiry)
 	stop := make(chan struct{})
 	go janitor.Run(stop)
 
@@ -104,10 +112,26 @@ func main() {
 	mux.HandleFunc("/admin/preview", srv.handlePreview)
 	mux.HandleFunc("/admin/firewall", srv.handleFirewall)
 	mux.HandleFunc("/admin/ipv6", srv.handleIPv6Toggle)
+	mux.HandleFunc("/admin/children", srv.handleChildren)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 
-	log.Printf("portknock %s listening on %s (dry-run=%v, expiry=%s, poll=%s, api=%v)", version, cfg.Listen, cfg.DryRun, cfg.Expiry, cfg.Poll, cfg.APIKey != "")
-	if err := http.ListenAndServe(cfg.Listen, mux); err != nil {
+	// HTTPS only, with an auto-generated self-signed cert kept next to the state
+	// file. Browsers warn on the self-signed cert, but all traffic (admin
+	// password, API keys, node-to-node sync) is encrypted.
+	certDir := filepath.Dir(cfg.StatePath)
+	cert, err := ensureSelfSignedCert(certDir)
+	if err != nil {
+		log.Fatalf("tls cert: %v", err)
+	}
+	srvHTTP := &http.Server{
+		Addr:      cfg.Listen,
+		Handler:   mux,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+	}
+	log.Printf("portknock %s listening on https://%s (%s, dry-run=%v, expiry=%s, poll=%s, api=%v)",
+		version, cfg.Listen, certInfo(cert), cfg.DryRun, cfg.Expiry, cfg.Poll, cfg.APIKey != "")
+	// Cert/key are already in TLSConfig, so pass empty paths.
+	if err := srvHTTP.ListenAndServeTLS("", ""); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -149,11 +173,12 @@ func (s *Server) clientIP(r *http.Request) string {
 // --- User-facing handlers ---
 
 type indexData struct {
-	ClientIP string
-	Ports    []int
-	Granted  bool
-	Error    string
-	CSRF     string
+	ClientIP   string
+	Ports      []int
+	Granted    bool
+	Error      string
+	CSRF       string
+	NeedPass   bool // user page should show a password field
 }
 
 const grantCSRFCookie = "portknock_grant_csrf"
@@ -172,7 +197,7 @@ func (s *Server) grantToken(w http.ResponseWriter, r *http.Request) string {
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.cfg.SecureCookie,
+		Secure:   true, // service is HTTPS-only
 		SameSite: http.SameSiteStrictMode,
 	})
 	return tok
@@ -188,7 +213,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		ClientIP: s.clientIP(r),
 		Ports:    st.Ports,
 		Granted:  r.URL.Query().Get("granted") == "1",
+		Error:    r.URL.Query().Get("err"),
 		CSRF:     s.grantToken(w, r),
+		NeedPass: s.cfg.GrantPass != "",
 	}
 	s.render(w, "index.html", data)
 }
@@ -197,18 +224,34 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 // rule. ip must already be validated by the caller. If the firewall rule cannot
 // be installed, the store grant is rolled back so the UI never shows an IP as
 // granted while it has no actual access.
-func (s *Server) grantDynamic(ip string) error {
-	if err := s.store.Grant(ip, time.Now()); err != nil {
+//
+// fanOut controls whether the grant is forwarded to child nodes. Pass true for
+// an original user submission (web page / local), false for a grant that
+// arrived FROM another node via /api/grant — otherwise two nodes that list each
+// other as children would push the same IP back and forth forever. This caps
+// propagation at a single hop and makes any topology (even A⇄B) loop-safe.
+func (s *Server) grantDynamic(ip string, fanOut bool) error {
+	added, err := s.store.Grant(ip, time.Now())
+	if err != nil {
 		return err
 	}
-	if err := s.fw.AllowIP(ip, "dyn"); err != nil {
-		// Roll back so state stays consistent with the firewall.
-		if rbErr := s.store.RevokeDynamic(ip); rbErr != nil {
-			log.Printf("grant rollback %s: %v", ip, rbErr)
+	// Only touch ufw / log when this is a NEW grant. A refresh (keep-alive
+	// re-push of an already-granted IP) just bumped LastSeen above; re-running
+	// ufw would fork a subprocess and spam an identical log line every poll.
+	if added {
+		if err := s.fw.AllowIP(ip, "dyn"); err != nil {
+			if rbErr := s.store.RevokeDynamic(ip); rbErr != nil { // keep state consistent with the firewall
+				log.Printf("grant rollback %s: %v", ip, rbErr)
+			}
+			return fmt.Errorf("install firewall rule: %w", err)
 		}
-		return fmt.Errorf("install firewall rule: %w", err)
+		log.Printf("granted dynamic all-port access to %s", ip)
 	}
-	log.Printf("granted dynamic all-port access to %s", ip)
+	// Only forward originals, in the background (never blocks the caller;
+	// failures are retried on the next janitor keep-alive).
+	if fanOut && s.syncer != nil {
+		s.syncer.FanOut(ip)
+	}
 	return nil
 }
 
@@ -225,12 +268,20 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or missing CSRF token; reload the page and try again", http.StatusForbidden)
 		return
 	}
+	// Optional shared password gate: when configured, the form must carry the
+	// matching password before anything is granted.
+	if s.cfg.GrantPass != "" {
+		if subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(s.cfg.GrantPass)) != 1 {
+			http.Redirect(w, r, "/?err=password", http.StatusSeeOther)
+			return
+		}
+	}
 	ip := s.clientIP(r)
 	if net.ParseIP(ip) == nil {
 		http.Error(w, "could not determine a valid client IP", http.StatusBadRequest)
 		return
 	}
-	if err := s.grantDynamic(ip); err != nil {
+	if err := s.grantDynamic(ip, true); err != nil { // web submission: fan out
 		log.Printf("grant %s: %v", ip, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -272,7 +323,10 @@ func (s *Server) handleAPIGrant(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ip"})
 		return
 	}
-	if err := s.grantDynamic(ip); err != nil {
+	// Forward to children UNLESS this request is itself a node-to-node sync push
+	// (marked by the syncer). That one-hop cap is what keeps A⇄B from looping.
+	fanOut := r.Header.Get(syncHeader) == ""
+	if err := s.grantDynamic(ip, fanOut); err != nil {
 		log.Printf("api grant %s: %v", ip, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
@@ -313,6 +367,9 @@ type adminData struct {
 	NumDynamic int
 	FWActive    bool // whether ufw is currently enabled
 	IPv6Managed bool // whether ufw manages IPv6 (IPV6=yes)
+	Children    []Child
+	APIKey      string // JSON API bearer token ("" = API disabled)
+	APIBase     string // base URL for API examples, e.g. http://host:8080
 }
 
 type fixedView struct {
@@ -402,6 +459,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(dyn, func(i, j int) bool { return dyn[i].IP < dyn[j].IP })
 
+	// Base URL for API examples: derive scheme from how we're reached.
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	apiBase := scheme + "://" + r.Host
+
 	s.render(w, "admin.html", adminData{
 		CSRF:       s.auth.CSRF(r),
 		Ports:      st.Ports,
@@ -417,6 +481,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		NumDynamic: len(st.Dynamic),
 		FWActive:    s.fw.IsActive(),
 		IPv6Managed: s.fw.IPv6Managed(),
+		Children:    st.Children,
+		APIKey:      s.cfg.APIKey,
+		APIBase:     apiBase,
 	})
 }
 
@@ -425,18 +492,29 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	ip := s.clientIP(r)
+	// Throttle brute force: refuse while this IP is locked out.
+	if locked, left := s.auth.Locked(ip); locked {
+		w.WriteHeader(http.StatusTooManyRequests)
+		s.render(w, "login.html", map[string]string{
+			"Error": fmt.Sprintf("尝试过多，请 %s 后再试。", left),
+		})
+		return
+	}
 	if !s.auth.CheckPassword(r.FormValue("password")) {
+		s.auth.RecordFail(ip)
 		w.WriteHeader(http.StatusUnauthorized)
 		s.render(w, "login.html", map[string]string{"Error": "invalid password"})
 		return
 	}
+	s.auth.RecordSuccess(ip)
 	token, _ := s.auth.NewSession()
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.cfg.SecureCookie,
+		Secure:   true, // service is HTTPS-only
 		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -512,6 +590,41 @@ func (s *Server) handleFixed(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
+// handleChildren manages downstream nodes this one fans grants out to.
+// POST action=add (url+key) | remove (url).
+func (s *Server) handleChildren(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	action := r.FormValue("action")
+	url := strings.TrimRight(strings.TrimSpace(r.FormValue("url")), "/")
+	var err error
+	switch action {
+	case "add":
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			http.Error(w, "节点地址需以 http:// 或 https:// 开头", http.StatusBadRequest)
+			return
+		}
+		key := strings.TrimSpace(r.FormValue("key"))
+		if key == "" {
+			http.Error(w, "缺少该节点的 API 密钥", http.StatusBadRequest)
+			return
+		}
+		err = s.store.AddChild(url, key)
+	case "remove":
+		err = s.store.RemoveChild(url)
+	default:
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		log.Printf("children %s %s: %v", action, url, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -526,8 +639,19 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if err := s.fw.RevokeIP(ip); err != nil {
-		log.Printf("revoke firewall %s: %v", ip, err)
+	// Don't delete the ufw rule if this IP is also a fixed whitelist entry —
+	// they share one `allow from <ip>` rule and the fixed access must survive.
+	isFixed := false
+	for _, f := range s.store.Snapshot().FixedIPs {
+		if f == ip {
+			isFixed = true
+			break
+		}
+	}
+	if !isFixed {
+		if err := s.fw.RevokeIP(ip); err != nil {
+			log.Printf("revoke firewall %s: %v", ip, err)
+		}
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }

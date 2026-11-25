@@ -19,7 +19,7 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	if err := s.Grant("1.2.3.4", now); err != nil {
+	if _, err := s.Grant("1.2.3.4", now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -81,3 +81,4 @@ func TestRevokeDynamicIdempotent(t *testing.T) {
 		t.Error("expected empty dynamic list")
 	}
 }
+
