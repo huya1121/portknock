@@ -82,3 +82,33 @@ func TestRevokeDynamicIdempotent(t *testing.T) {
 	}
 }
 
+func TestSyncInterval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := NewStore(path)
+	def := 2 * time.Minute
+
+	// Unset -> falls back to default.
+	if got := s.SyncIntervalOr(def); got != def {
+		t.Errorf("unset: got %v, want %v", got, def)
+	}
+
+	// Normal value round-trips (and survives reload).
+	if err := s.SetSyncInterval(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SyncIntervalOr(def); got != 30*time.Second {
+		t.Errorf("set 30s: got %v", got)
+	}
+	s2, _ := NewStore(path)
+	if got := s2.SyncIntervalOr(def); got != 30*time.Second {
+		t.Errorf("after reload: got %v", got)
+	}
+
+	// Below the 10s floor is clamped up, both on write and on read.
+	if err := s.SetSyncInterval(3 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SyncIntervalOr(def); got != minSyncInterval {
+		t.Errorf("clamp 3s: got %v, want %v", got, minSyncInterval)
+	}
+}

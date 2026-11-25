@@ -27,10 +27,21 @@ type Child struct {
 // State is the full persisted state of the service. It is the single source of
 // truth; the firewall is reconciled to match it.
 type State struct {
-	Ports    []int     `json:"ports"`     // whitelisted TCP ports
+	Ports    []int     `json:"ports"`     // local-only open TCP ports (not synced)
 	FixedIPs []string  `json:"fixed_ips"` // permanent whitelist
 	Dynamic  []Dynamic `json:"dynamic"`   // user-submitted, idle-expiry applies
 	Children []Child   `json:"children"`  // downstream nodes to fan grants out to
+	// SyncPorts are open ports this node (as a center) distributes to all its
+	// children; they are also opened locally. ReceivedPorts are open ports this
+	// node (as a child) received from an upstream center. A single host can be
+	// both, so the two are tracked separately. All three port lists are unioned
+	// when reconciling the firewall.
+	SyncPorts     []int `json:"sync_ports"`
+	ReceivedPorts []int `json:"received_ports"`
+	// SyncInterval is the keep-alive re-push interval to children, as a Go
+	// duration string (e.g. "2m", "30s"). Empty = default. Configurable from the
+	// admin UI; the syncer's keep-alive loop reads it each pass.
+	SyncInterval string `json:"sync_interval"`
 }
 
 // Store guards State with a mutex and persists it atomically to disk.
@@ -66,6 +77,12 @@ func NewStore(path string) (*Store, error) {
 	if s.state.Children == nil {
 		s.state.Children = []Child{}
 	}
+	if s.state.SyncPorts == nil {
+		s.state.SyncPorts = []int{}
+	}
+	if s.state.ReceivedPorts == nil {
+		s.state.ReceivedPorts = []int{}
+	}
 	return s, nil
 }
 
@@ -78,10 +95,13 @@ func (s *Store) Snapshot() State {
 
 func (s *Store) copyLocked() State {
 	cp := State{
-		Ports:    append([]int(nil), s.state.Ports...),
-		FixedIPs: append([]string(nil), s.state.FixedIPs...),
-		Dynamic:  append([]Dynamic(nil), s.state.Dynamic...),
-		Children: append([]Child(nil), s.state.Children...),
+		Ports:         append([]int(nil), s.state.Ports...),
+		FixedIPs:      append([]string(nil), s.state.FixedIPs...),
+		Dynamic:       append([]Dynamic(nil), s.state.Dynamic...),
+		Children:      append([]Child(nil), s.state.Children...),
+		SyncPorts:     append([]int(nil), s.state.SyncPorts...),
+		ReceivedPorts: append([]int(nil), s.state.ReceivedPorts...),
+		SyncInterval:  s.state.SyncInterval,
 	}
 	return cp
 }
@@ -118,8 +138,8 @@ func (s *Store) persistLocked() error {
 
 // --- Mutating operations. Each persists and returns an error on failure. ---
 
-// SetPorts replaces the whitelisted port list (deduped, sorted, validated).
-func (s *Store) SetPorts(ports []int) error {
+// cleanPorts dedupes, validates (1..65535) and sorts a port list.
+func cleanPorts(ports []int) []int {
 	seen := map[int]bool{}
 	clean := []int{}
 	for _, p := range ports {
@@ -130,10 +150,66 @@ func (s *Store) SetPorts(ports []int) error {
 		clean = append(clean, p)
 	}
 	sort.Ints(clean)
+	return clean
+}
+
+// SetPorts replaces the local-only open port list (deduped, sorted, validated).
+func (s *Store) SetPorts(ports []int) error {
+	clean := cleanPorts(ports)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Ports = clean
 	return s.persistLocked()
+}
+
+// SetSyncPorts replaces the list of open ports this node distributes to children.
+func (s *Store) SetSyncPorts(ports []int) error {
+	clean := cleanPorts(ports)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.SyncPorts = clean
+	return s.persistLocked()
+}
+
+// SetReceivedPorts replaces the list of open ports received from an upstream
+// center (child side). Full-list replace = the center's declarative push wins.
+func (s *Store) SetReceivedPorts(ports []int) error {
+	clean := cleanPorts(ports)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.ReceivedPorts = clean
+	return s.persistLocked()
+}
+
+// minSyncInterval is the floor for the child keep-alive interval: anything lower
+// would hammer children / CPU without benefit (grants have a 48h expiry window).
+const minSyncInterval = 10 * time.Second
+
+// SetSyncInterval persists the child keep-alive interval, clamped to >= 10s.
+func (s *Store) SetSyncInterval(d time.Duration) error {
+	if d < minSyncInterval {
+		d = minSyncInterval
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.SyncInterval = d.String()
+	return s.persistLocked()
+}
+
+// SyncIntervalOr returns the configured sync interval, falling back to def when
+// unset or unparseable, and never returning less than minSyncInterval.
+func (s *Store) SyncIntervalOr(def time.Duration) time.Duration {
+	s.mu.Lock()
+	raw := s.state.SyncInterval
+	s.mu.Unlock()
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		d = def
+	}
+	if d < minSyncInterval {
+		d = minSyncInterval
+	}
+	return d
 }
 
 // AddChild adds (or updates the key of) a downstream node, keyed by URL.
@@ -253,4 +329,3 @@ func (s *Store) TouchAndExpire(active map[string]bool, window time.Duration, now
 	}
 	return expired, nil
 }
-

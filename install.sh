@@ -159,8 +159,18 @@ cmd_install() {
     local want got
     want="$(awk '{print $1}' "$tmp.sha256")"
     got="$(sha256sum "$tmp" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "校验和不匹配，已中止。"
-    say "校验和 OK"
+    if [ -z "$want" ]; then
+      warn "校验和文件为空，无法验证二进制完整性（继续安装）。"
+    elif [ "$want" != "$got" ]; then
+      rm -f "$tmp" "$tmp.sha256"
+      die "校验和不匹配，已中止（期望 ${want}，实际 ${got}）。"
+    else
+      say "校验和 OK"
+    fi
+  else
+    # Checksum fetch failed (network/CDN/attacker dropping just this object).
+    # Don't silently skip — the release always publishes a .sha256, so warn loudly.
+    warn "无法获取校验和文件（${url}.sha256），本次安装未验证二进制完整性。如介意请重试或手动核对。"
   fi
 
   install -m 0755 "$tmp" "$BIN_PATH"
@@ -202,6 +212,7 @@ EOF
   seed_state
   allow_ssh
   allow_listen_port
+  enable_ufw   # after the allow rules above, so enabling can't lock us out
   check_port
 
   write_service
@@ -233,6 +244,9 @@ EOF
     echo "  用户口令：已设置（访客需输入口令才能放行）"
   else
     echo "  用户口令：未设置（任何人打开用户页即可放行自己）。可用 PORTKNOCK_GRANT_PASSWORD=... 重装开启"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qi 'active'; then
+    echo "  防火墙：  ufw 已启用，白名单规则生效中"
   fi
   echo
   echo "管理命令（直接运行 ${SUDO}portknock-ctl 不带参数可进交互菜单）："
@@ -336,6 +350,24 @@ allow_listen_port() {
     say "已放行管理监听端口 ${port}/tcp（对外访问用，管理台删不掉）。"
   else
     warn "放行监听端口 ${port} 失败，请手动执行： ufw allow ${port}/tcp"
+  fi
+}
+
+# enable_ufw turns ufw on so the whitelist rules actually take effect. MUST run
+# only AFTER allow_ssh + allow_listen_port, so enabling can never lock us out of
+# SSH or the management port. "ufw --force enable" skips the interactive y/n
+# prompt (we've already opened the escape-hatch ports above).
+enable_ufw() {
+  command -v ufw >/dev/null 2>&1 || { warn "无 ufw，跳过启用。"; return; }
+  local status; status="$(ufw status 2>/dev/null | head -1 || true)"
+  if printf '%s' "$status" | grep -qi 'Status: active'; then
+    say "ufw 已处于启用状态。"
+    return
+  fi
+  if ufw --force enable >/dev/null 2>&1; then
+    say "✅ 已启用 ufw 防火墙（白名单规则即刻生效）。"
+  else
+    warn "启用 ufw 失败，请手动执行： ${SUDO}ufw enable"
   fi
 }
 
@@ -691,4 +723,3 @@ main() {
 }
 
 main "$@"
-

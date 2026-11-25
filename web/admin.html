@@ -75,21 +75,29 @@
   .pill.perm { background:rgba(52,211,153,.14); border-color:rgba(52,211,153,.4); color:#bbf7d0; }
   .pill.world { background:rgba(251,191,36,.14); border-color:rgba(251,191,36,.4); color:#fde68a; }
   .row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
-  input[type=text] {
-    padding:.65rem .8rem; font-size:1rem; color:var(--fg); background:rgba(255,255,255,.05);
-    border:1px solid var(--card-br); border-radius:11px; outline:none; transition:border-color .15s, box-shadow .15s;
+  /* All visible inputs (text/password/number/…), not just type=text, share the
+     same look and a fixed height so they line up with buttons on the same row. */
+  input:not([type=hidden]), input[type=text] {
+    height:42px; padding:.55rem .85rem; font-size:1rem; color:var(--fg); background:rgba(255,255,255,.05);
+    border:1px solid var(--card-br); border-radius:11px; outline:none;
+    transition:border-color .15s, box-shadow .15s, background .15s;
   }
-  input[type=text]:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  input:not([type=hidden])::placeholder { color:var(--muted); opacity:.75; }
+  input:not([type=hidden]):focus, input[type=text]:focus {
+    border-color:var(--accent); background:rgba(255,255,255,.08); box-shadow:0 0 0 3px var(--ring);
+  }
   /* Flexible inputs inside a .row: grow but never force the row wider than the
      viewport (min-width:0 lets them shrink; they wrap to full width on mobile). */
   .grow1 { flex:1 1 180px; min-width:0; }
   .grow2 { flex:2 1 220px; min-width:0; }
   .btn {
-    font-size:.93rem; font-weight:600; padding:.6rem 1.15rem; border:0; border-radius:11px; color:#fff;
+    font-size:.93rem; font-weight:600; height:42px; padding:0 1.15rem; border:0; border-radius:11px; color:#fff;
     cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent2));
-    box-shadow:0 8px 24px -10px var(--ring); transition:transform .08s; white-space:nowrap;
+    box-shadow:0 8px 24px -10px var(--ring); transition:transform .08s, filter .15s; white-space:nowrap;
+    display:inline-flex; align-items:center; justify-content:center;
   }
-  .btn:hover { transform:translateY(-1px); }
+  .btn:hover { transform:translateY(-1px); filter:brightness(1.07); }
+  .btn:active { transform:translateY(0); }
   .btn.danger { background:linear-gradient(135deg,#ef4444,#b91c1c); box-shadow:none; }
 
   table { border-collapse:collapse; width:100%; font-size:.9rem; margin-top:.25rem; }
@@ -97,6 +105,9 @@
     letter-spacing:.08em; padding:.4rem .7rem; border-bottom:1px solid var(--card-br); white-space:nowrap; }
   td { padding:.6rem .7rem; border-bottom:1px solid rgba(255,255,255,.06); vertical-align:middle; }
   tr:last-child td { border-bottom:0; }
+  /* Subtle row hover (desktop only; mobile turns rows into cards further down). */
+  tbody tr { transition:background .12s; }
+  tbody tr:hover td { background:rgba(255,255,255,.035); }
   .mono { font-family:ui-monospace,"SF Mono",monospace; }
   .self { font-size:.68rem; font-weight:600; margin-left:.4rem; padding:.05rem .4rem; border-radius:999px;
     background:rgba(109,140,255,.2); border:1px solid rgba(109,140,255,.45); color:#c7d2fe; vertical-align:middle; }
@@ -107,6 +118,12 @@
     margin-right:.35rem; vertical-align:middle; }
   .dot-ok { background:var(--ok); } .dot-bad { background:var(--danger); } .dot-unk { background:var(--muted); }
   .synced { color:var(--muted); font-size:.78rem; margin-left:.4rem; }
+  .upstream { margin-top:1rem; padding-top:.9rem; border-top:1px solid var(--card-br); }
+  .uprow { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; padding:.3rem 0; }
+  .pager { display:flex; align-items:center; justify-content:center; gap:.8rem; margin-top:.6rem; }
+  .pager .ghost { padding:.35rem .8rem; font-size:.84rem; }
+  .pager .ghost:disabled { opacity:.4; cursor:default; }
+  .pager-info { color:var(--muted); font-size:.82rem; font-variant-numeric:tabular-nums; }
   .chips { display:flex; flex-wrap:wrap; gap:.45rem; margin-top:.9rem; }
   .chip { font-family:ui-monospace,monospace; font-size:.85rem; font-weight:600; padding:.28rem .65rem;
     border-radius:999px; background:linear-gradient(135deg, rgba(251,191,36,.18), rgba(245,158,11,.18));
@@ -320,30 +337,70 @@
       <input type="text" name="key" placeholder="该节点的 API 密钥" required class="grow1">
       <button class="btn" type="submit">添加</button>
     </form>
-    <table>
-      <tbody>
-      {{range .Children}}
-        <tr>
-          <td class="ipcell mono">{{.URL}}</td>
-          <td data-label="状态">
-            {{if eq .Status "ok"}}<span class="dot-ok"></span>正常{{else if eq .Status "fail"}}<span class="dot-bad"></span>异常{{else}}<span class="dot-unk"></span>未知{{end}}
-            <span class="synced">{{.Detail}}</span>
-          </td>
-          <td data-label="操作" style="text-align:right;">
-            <form method="post" action="/admin/children" onsubmit="return confirm('移除子节点 {{.URL}}？今后放行不再推给它（已推过的不受影响）。');">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="action" value="remove">
-              <input type="hidden" name="url" value="{{.URL}}">
-              <button class="btn danger" type="submit">移除</button>
-            </form>
-          </td>
-        </tr>
-      {{else}}
-        <tr><td class="empty" colspan="3">（未配置子节点，本机为独立节点）</td></tr>
+    <div class="paged-list" data-page-size="10">
+      {{if gt (len .Children) 10}}
+      <div class="row" style="margin:.4rem 0 .2rem;">
+        <input type="text" class="pager-filter grow1" placeholder="过滤节点地址 / 状态…">
+      </div>
       {{end}}
-      </tbody>
-    </table>
+      <table>
+        <tbody>
+        {{range .Children}}
+          <tr>
+            <td class="ipcell mono">{{.URL}}</td>
+            <td data-label="状态">
+              {{if eq .Status "ok"}}<span class="dot-ok"></span>正常{{else if eq .Status "fail"}}<span class="dot-bad"></span>异常{{else}}<span class="dot-unk"></span>未知{{end}}
+              <span class="synced">{{.Detail}}</span>
+            </td>
+            <td data-label="操作" style="text-align:right;">
+              <form method="post" action="/admin/children" onsubmit="return confirm('移除子节点 {{.URL}}？今后放行不再推给它（已推过的不受影响）。');">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="url" value="{{.URL}}">
+                <button class="btn danger" type="submit">移除</button>
+              </form>
+            </td>
+          </tr>
+        {{else}}
+          <tr><td class="empty" colspan="3">（未配置子节点，本机为独立节点）</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if gt (len .Children) 10}}
+      <div class="pager">
+        <button type="button" class="ghost" data-page="prev">上一页</button>
+        <span class="pager-info"></span>
+        <button type="button" class="ghost" data-page="next">下一页</button>
+      </div>
+      {{end}}
+    </div>
     <p class="desc" style="margin-top:.7rem;font-size:.8rem;">状态来自最近一次推送结果（添加节点或下次放行后刷新）。</p>
+
+    <div class="upstream">
+      <div class="k" style="margin-bottom:.45rem;">同步保活间隔<span class="synced">当前：{{.SyncInterval}}</span></div>
+      <p class="desc" style="font-size:.8rem;margin:0 0 .5rem;">每隔这么久向所有子节点重推一次完整白名单（IP + 端口），防止子节点上的规则空闲过期。
+        新放行本来就会立即推送，这里只影响“保活重推”频率。最小 10 秒，改动下一轮生效。</p>
+      <form method="post" action="/admin/sync-interval" class="row">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="text" name="interval" value="{{.SyncIntervalSec}}" placeholder="秒数，如 120" inputmode="numeric" class="grow1">
+        <button class="btn" type="submit">保存</button>
+      </form>
+    </div>
+
+    {{if .Upstreams}}
+    <div class="upstream">
+      <div class="k" style="margin-bottom:.4rem;">⬆ 上游主节点（本机被这些节点加为子节点，正在接收它们的同步）</div>
+      {{range .Upstreams}}
+        <div class="uprow"><span class="mono">{{.IP}}</span><span class="synced">{{.Detail}}</span></div>
+      {{end}}
+    </div>
+    {{end}}
+    {{if .ReceivedPorts}}
+    <div class="upstream">
+      <div class="k" style="margin-bottom:.4rem;">⬇ 来自上游的同步端口（由主节点下发，本机已开放）</div>
+      <div class="chips">{{range .ReceivedPorts}}<span class="chip">{{.}}/tcp</span>{{end}}</div>
+    </div>
+    {{end}}
   </div>
 
   <div class="card" data-tab="cluster">
@@ -354,8 +411,8 @@
     {{if .APIKey}}
     <p class="desc">脚本 / CI / 路由器可以用这个接口放行 IP（也用于子节点同步）。密钥如下，请妥善保管。</p>
     <div class="kv">
-      <div class="k">接口地址</div>
-      <div class="vrow"><span class="v mono" id="api-url">{{.APIBase}}/api/grant</span><button type="button" class="copy" data-copy="api-url">复制</button></div>
+      <div class="k">节点地址（复制后填到主控的「子节点」）</div>
+      <div class="vrow"><span class="v mono" id="api-url">{{.APIBase}}</span><button type="button" class="copy" data-copy="api-url">复制</button></div>
     </div>
     <div class="kv">
       <div class="k">API 密钥</div>
@@ -381,15 +438,30 @@ curl -k -X POST {{.APIBase}}/api/grant \
   <div class="card" data-tab="whitelist">
     <h2>
       <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h18" stroke="currentColor" stroke-width="1.6"/></svg>
-      对外开放端口<span class="pill world">所有人可访问</span>
+      对外开放端口<span class="pill world">所有人可访问</span><span class="pill">仅本机</span>
     </h2>
-    <p class="desc">这些 TCP 端口对<strong>任意 IP</strong> 开放。用逗号或空格分隔端口号。</p>
-    <form method="post" action="/admin/ports" class="row pk-form" data-action="ports" data-value-field="ports" data-title="保存开放端口">
+    <p class="desc">这些 TCP 端口对<strong>任意 IP</strong> 开放，<strong>只在本机生效</strong>、不下发子节点。用逗号或空格分隔端口号。</p>
+    <form method="post" action="/admin/ports" class="row pk-form" data-action="ports" data-value-field="ports" data-title="保存本机开放端口">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="text" name="ports" value="{{.PortsStr}}" placeholder="例如 80, 443" inputmode="numeric" class="grow1">
       <button class="btn" type="submit">保存</button>
     </form>
     {{if .Ports}}<div class="chips">{{range .Ports}}<span class="chip">{{.}}/tcp</span>{{end}}</div>{{end}}
+  </div>
+
+  <div class="card" data-tab="whitelist">
+    <h2>
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h18" stroke="currentColor" stroke-width="1.6"/><path d="M15 19l3 3 4-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      同步开放端口<span class="pill world">所有人可访问</span><span class="pill perm">同步到子节点</span>
+    </h2>
+    <p class="desc">这些 TCP 端口在本机开放，并<strong>批量下发到所有子节点</strong>（它们也照此开放）。
+      采用全量同步：这里删掉的端口，子节点上也会随之关闭。</p>
+    <form method="post" action="/admin/sync-ports" class="row pk-form" data-action="sync-ports" data-value-field="ports" data-title="保存并下发同步端口">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="text" name="ports" value="{{.SyncPortsStr}}" placeholder="例如 8000, 9000" inputmode="numeric" class="grow1">
+      <button class="btn" type="submit">保存并下发</button>
+    </form>
+    {{if .SyncPorts}}<div class="chips">{{range .SyncPorts}}<span class="chip">{{.}}/tcp</span>{{end}}</div>{{end}}
   </div>
 
   <div class="card" data-tab="whitelist">
@@ -416,25 +488,39 @@ curl -k -X POST {{.APIBase}}/api/grant \
       </div>
       {{end}}
     {{end}}
-    <table>
-      <tbody>
-      {{range .FixedIPs}}
-        <tr>
-          <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
-          <td data-label="操作" style="text-align:right;">
-            <form method="post" action="/admin/fixed" class="pk-form" data-action="fixed-remove" data-value="{{.IP}}" data-title="删除固定白名单 IP {{.IP}}">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="action" value="remove">
-              <input type="hidden" name="ip" value="{{.IP}}">
-              <button class="btn danger" type="submit">删除</button>
-            </form>
-          </td>
-        </tr>
-      {{else}}
-        <tr><td class="empty" colspan="2">（暂无固定 IP）</td></tr>
+    <div class="paged-list" data-page-size="10">
+      {{if gt (len .FixedIPs) 10}}
+      <div class="row" style="margin:.4rem 0 .2rem;">
+        <input type="text" class="pager-filter grow1" placeholder="过滤 IP…">
+      </div>
       {{end}}
-      </tbody>
-    </table>
+      <table>
+        <tbody>
+        {{range .FixedIPs}}
+          <tr>
+            <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
+            <td data-label="操作" style="text-align:right;">
+              <form method="post" action="/admin/fixed" class="pk-form" data-action="fixed-remove" data-value="{{.IP}}" data-title="删除固定白名单 IP {{.IP}}">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="ip" value="{{.IP}}">
+                <button class="btn danger" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {{else}}
+          <tr><td class="empty" colspan="2">（暂无固定 IP）</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if gt (len .FixedIPs) 10}}
+      <div class="pager">
+        <button type="button" class="ghost" data-page="prev">上一页</button>
+        <span class="pager-info"></span>
+        <button type="button" class="ghost" data-page="next">下一页</button>
+      </div>
+      {{end}}
+    </div>
   </div>
 
   <div class="card" data-tab="overview">
@@ -443,31 +529,45 @@ curl -k -X POST {{.APIBase}}/api/grant \
       动态放行 IP<span class="pill">全端口 · 空闲 {{.Expiry}} 回收</span>
     </h2>
     <p class="desc">用户自助提交的 IP，可访问所有端口；超过 {{.Expiry}} 无连接记录将自动移除。</p>
-    <table>
-      <thead><tr><th>IP</th><th>首次放行</th><th>最后活动</th><th>已空闲</th><th></th></tr></thead>
-      <tbody>
-      {{range .Dynamic}}
-        <tr>
-          <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
-          <td data-label="首次放行" class="mono" style="color:var(--muted)">{{.AddedAt}}</td>
-          <td data-label="最后活动" class="mono" style="color:var(--muted)">{{.LastSeen}}</td>
-          <td data-label="已空闲" class="mono idle-{{.IdleLevel}}">{{.IdleFor}}</td>
-          <td data-label="操作" style="text-align:right;">
-            <form method="post" action="/admin/revoke" class="pk-form" data-action="revoke" data-value="{{.IP}}" data-title="立即移除 {{.IP}}">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="ip" value="{{.IP}}">
-              <button class="btn danger" type="submit">立即移除</button>
-            </form>
-          </td>
-        </tr>
-      {{else}}
-        <tr><td class="empty" colspan="5">（暂无动态放行 IP）</td></tr>
+    <div class="paged-list" data-page-size="10">
+      {{if gt (len .Dynamic) 10}}
+      <div class="row" style="margin:.4rem 0 .2rem;">
+        <input type="text" class="pager-filter grow1" placeholder="过滤 IP…">
+      </div>
       {{end}}
-      </tbody>
-    </table>
+      <table>
+        <thead><tr><th>IP</th><th>首次放行</th><th>最后活动</th><th>已空闲</th><th></th></tr></thead>
+        <tbody>
+        {{range .Dynamic}}
+          <tr>
+            <td class="ipcell mono">{{.IP}}{{if .IsSelf}}<span class="self">本机</span>{{end}}</td>
+            <td data-label="首次放行" class="mono" style="color:var(--muted)">{{.AddedAt}}</td>
+            <td data-label="最后活动" class="mono" style="color:var(--muted)">{{.LastSeen}}</td>
+            <td data-label="已空闲" class="mono idle-{{.IdleLevel}}">{{.IdleFor}}</td>
+            <td data-label="操作" style="text-align:right;">
+              <form method="post" action="/admin/revoke" class="pk-form" data-action="revoke" data-value="{{.IP}}" data-title="立即移除 {{.IP}}">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="ip" value="{{.IP}}">
+                <button class="btn danger" type="submit">立即移除</button>
+              </form>
+            </td>
+          </tr>
+        {{else}}
+          <tr><td class="empty" colspan="5">（暂无动态放行 IP）</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if gt (len .Dynamic) 10}}
+      <div class="pager">
+        <button type="button" class="ghost" data-page="prev">上一页</button>
+        <span class="pager-info"></span>
+        <button type="button" class="ghost" data-page="next">下一页</button>
+      </div>
+      {{end}}
+    </div>
   </div>
 
-  <div class="foot">页面每 30 秒自动刷新空闲状态 · 变更前会预览防火墙规则</div>
+  <div class="foot">页面每 30 秒自动刷新空闲状态 · 变更前会预览防火墙规则 · portknock {{.Version}}</div>
 </div>
 
 <div class="modal-backdrop" id="pk-modal">
@@ -529,6 +629,42 @@ curl -k -X POST {{.APIBase}}/api/grant \
       var el = document.getElementById(btn.getAttribute('data-copy'));
       if (el) copyText(el.textContent.trim(), btn);
     });
+  });
+
+  // --- 通用清单分页 + 过滤：任何 .paged-list 都生效（清单 >页大小 时才渲染控件）---
+  document.querySelectorAll('.paged-list').forEach(function (wrap) {
+    var table = wrap.querySelector('table');
+    var pager = wrap.querySelector('.pager');
+    if (!table || !pager) return;              // 条目不多，无分页控件
+    var PAGE = parseInt(wrap.getAttribute('data-page-size'), 10) || 10;
+    var page = 0, filter = '';
+    var info = pager.querySelector('.pager-info');
+    var filterBox = wrap.querySelector('.pager-filter');
+    var prev = pager.querySelector('[data-page="prev"]');
+    var next = pager.querySelector('[data-page="next"]');
+    function rows() {
+      return Array.prototype.slice.call(table.tBodies[0].rows)
+        .filter(function (tr) { return !tr.querySelector('td.empty'); });
+    }
+    function render() {
+      var all = rows();
+      var f = filter.trim().toLowerCase();
+      var shown = f ? all.filter(function (tr) { return tr.textContent.toLowerCase().indexOf(f) >= 0; }) : all;
+      var pages = Math.max(1, Math.ceil(shown.length / PAGE));
+      if (page >= pages) page = pages - 1;
+      if (page < 0) page = 0;
+      all.forEach(function (tr) { tr.style.display = 'none'; });
+      shown.slice(page * PAGE, page * PAGE + PAGE).forEach(function (tr) { tr.style.display = ''; });
+      info.textContent = shown.length
+        ? ('第 ' + (page + 1) + ' / ' + pages + ' 页 · 共 ' + shown.length + ' 条' + (f ? '（已过滤）' : ''))
+        : '无匹配项';
+      prev.disabled = page <= 0;
+      next.disabled = page >= pages - 1;
+    }
+    prev.addEventListener('click', function () { page--; render(); });
+    next.addEventListener('click', function () { page++; render(); });
+    if (filterBox) filterBox.addEventListener('input', function () { filter = filterBox.value; page = 0; render(); });
+    render();
   });
 
   var pendingForm = null, refreshPaused = false;
@@ -623,4 +759,3 @@ curl -k -X POST {{.APIBase}}/api/grant \
 </script>
 </body>
 </html>
-

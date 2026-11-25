@@ -58,4 +58,3 @@ func TestFirstValue(t *testing.T) {
 		t.Errorf("end: got %q", got)
 	}
 }
-

@@ -116,4 +116,3 @@ func certInfo(c tls.Certificate) string {
 	}
 	return fmt.Sprintf("self-signed, valid until %s", leaf.NotAfter.Format("2006-01-02"))
 }
-

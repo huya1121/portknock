@@ -33,12 +33,17 @@ type Syncer struct {
 	store  *Store
 	client *http.Client
 	mu     sync.Mutex
-	status map[string]ChildStatus // child URL -> last push result
+	status map[string]ChildStatus // child URL -> last push result (outbound)
+	// upstreams records who has pushed sync grants TO this node (inbound), so a
+	// node that was added as someone's child can show its upstream center(s) in
+	// the admin UI. Keyed by the pushing node's IP -> last time it pushed.
+	upstreams map[string]time.Time
 }
 
 func NewSyncer(store *Store) *Syncer {
 	return &Syncer{
-		store: store,
+		store:     store,
+		upstreams: map[string]time.Time{},
 		// Node-to-node sync skips TLS cert verification on purpose: every node
 		// serves a self-signed cert whose SANs cover only its local interface
 		// IPs (not NAT/public IPs or hostnames), so chain verification can never
@@ -69,6 +74,30 @@ func (s *Syncer) Status() map[string]ChildStatus {
 	defer s.mu.Unlock()
 	out := make(map[string]ChildStatus, len(s.status))
 	for k, v := range s.status {
+		out[k] = v
+	}
+	return out
+}
+
+// RecordUpstream notes that node `ip` just pushed a sync grant to us. Called
+// from /api/grant when the request carries the sync header, so this node can
+// show which center(s) it is a child of. Keeps only the latest time per IP.
+func (s *Syncer) RecordUpstream(ip string) {
+	if ip == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.upstreams[ip] = time.Now()
+}
+
+// Upstreams returns a copy of the upstream centers (IP -> last push time) that
+// have synced grants to this node.
+func (s *Syncer) Upstreams() map[string]time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]time.Time, len(s.upstreams))
+	for k, v := range s.upstreams {
 		out[k] = v
 	}
 	return out
@@ -142,6 +171,78 @@ func (s *Syncer) pushToChildren(children []Child, ips []string) {
 	wg.Wait()
 }
 
+// pushPortsOne sends the full sync-port list to a single child's /api/ports.
+// Like pushOne it skips TLS verification and carries the sync header + API key.
+func (s *Syncer) pushPortsOne(ctx context.Context, c Child, ports []int) error {
+	body, _ := json.Marshal(map[string][]int{"ports": ports})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, childBase(c.URL)+"/api/ports", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(syncHeader, "1")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("child %s returned HTTP %d", c.URL, resp.StatusCode)
+	}
+	return nil
+}
+
+// FanOutPorts pushes the full sync-port list to every child concurrently in the
+// background. Declarative/full-list: a child replaces its received ports with
+// exactly this set, so a port removed at the center closes on the child too.
+func (s *Syncer) FanOutPorts() {
+	st := s.store.Snapshot()
+	if len(st.Children) == 0 {
+		return
+	}
+	ports := append([]int(nil), st.SyncPorts...)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, c := range st.Children {
+			c := c
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := s.pushPortsOne(ctx, c, ports); err != nil {
+					log.Printf("sync: push ports -> %s: %v", c.URL, err)
+				} else {
+					log.Printf("sync: pushed %d port(s) -> %s", len(ports), c.URL)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+}
+
+// RunKeepAlive periodically re-pushes the full whitelist (IPs + ports) to all
+// children so they don't expire grants on their own idle timer. The interval is
+// read from the store each pass, so changing it in the admin UI takes effect on
+// the next tick without a restart. Runs until stop is closed. Does one immediate
+// pass on start. defInterval is the fallback when none is configured.
+func (s *Syncer) RunKeepAlive(stop <-chan struct{}, defInterval time.Duration) {
+	s.FanOutAll() // immediate first pass
+	timer := time.NewTimer(s.store.SyncIntervalOr(defInterval))
+	defer timer.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+			s.FanOutAll()
+			timer.Reset(s.store.SyncIntervalOr(defInterval)) // re-read: picks up admin changes
+		}
+	}
+}
+
 // FanOut pushes one ip to all configured children in the background.
 func (s *Syncer) FanOut(ip string) {
 	children := s.store.Snapshot().Children
@@ -164,9 +265,10 @@ func (s *Syncer) FanOutAll() {
 		ips = append(ips, d.IP)
 	}
 	ips = append(ips, st.FixedIPs...)
-	if len(ips) == 0 {
-		return
+	if len(ips) > 0 {
+		go s.pushToChildren(st.Children, ips)
 	}
-	go s.pushToChildren(st.Children, ips)
+	// Also re-push the sync-port list each pass so children stay converged and
+	// a removed port is re-asserted as closed (full-list/declarative).
+	s.FanOutPorts()
 }
-

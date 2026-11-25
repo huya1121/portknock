@@ -201,22 +201,43 @@ curl -k -X POST https://host/api/grant \
 部署了多台 portknock 时，可以让一台当"中心"，在它网页上放行的 IP 自动同步到其它节点，
 不用逐台操作。配置全在管理台，不需要外部脚本。
 
-**怎么配**：在中心节点管理台的「子节点同步」卡片里，逐个填子节点的地址（如
-`https://10.0.0.11:8080`）和它的 **API 密钥**（子节点要配 `PORTKNOCK_API_KEY` 开启 API，
-在它自己管理台的「JSON API」卡片能看到）。之后中心每次有用户自助放行，就在后台调所有子节点的
-`/api/grant` 把这个 IP 推过去；不阻塞页面，某个子节点离线只记日志、不影响其余。janitor 每轮
-（默认 2 分钟）会重推一遍存活的动态 IP，保证子节点上的规则不会因 48 小时空闲被回收。
+**怎么配**：在中心节点管理台「集群 / API」页的「子节点同步」卡片里，逐个填子节点的**节点地址**和它的
+**API 密钥**。节点地址直接复制子节点管理台「JSON API」卡片里显示的那一行即可（如
+`https://10.0.0.11:8080`，不用带 `/api/grant` 后缀；就算带了也会自动去掉）。子节点需先配
+`PORTKNOCK_API_KEY` 开启 API。之后中心每次放行，就在后台调所有子节点的 `/api/grant` 把 IP 推过去；
+不阻塞页面，某个子节点离线只记日志、不影响其余。janitor 每轮（默认 2 分钟）会重推一遍存活的 IP，
+保证子节点上的规则不会因 48 小时空闲被回收。
+
+**两种 IP 都同步**：用户自助放行的动态 IP、以及 admin 手动加的固定 IP，**都会**推送到子节点。
+固定 IP 推到子节点后在子节点上表现为**动态 IP**，靠中心的 janitor 保活不过期（子节点的 API 只能动态放行）。
+固定 IP 的**移除不会**同步——删掉后子节点那份会自己空闲回收掉。
+
+**开放端口可选同步**：对外开放端口分两类——
+- 「**对外开放端口（仅本机）**」：只在本机生效，不下发，保持原行为。
+- 「**同步开放端口**」：在中心配置后，批量下发到所有子节点，子节点照此开放（也在中心本机开放）。
+  采用**全量声明式同步**：中心每次推完整列表，子节点按最新列表收敛，所以中心删掉的端口子节点也随之关闭。
+  通过内部端点 `/api/ports` 下发（需 API 密钥 + 同步标记，非公开接口）；子节点把收到的端口持久化进自己的
+  `state.json`，重启不丢。子节点管理台会在集群页显示「来自上游的同步端口」。
+
+**节点状态**：子节点表格会显示每个节点最近一次推送的结果——🟢 正常 / 🔴 异常 / ⚪ 未知（还没推过），
+异常时附失败原因（如密钥不对、连不上）。状态来自最近一次真实推送，不额外发探测请求，所以不拖慢页面。
+被加为子节点的机器，会在集群页显示「⬆ 上游主节点」——即正在给它推送的中心节点。
+
+**同步保活间隔可配**：集群页可设置向子节点重推完整白名单的间隔（最小 10 秒，改动下一轮生效，无需重启）。
+注意这只影响"保活重推"频率——新放行/改动本来就会立即推送。间隔存进 `state.json`，与 conntrack 回收采样
+（`--poll`）相互独立。
 
 **角色随时切换**：每台跑的都是同一个二进制，配了子节点就是中心、没配就是普通节点，在管理台
 加/删子节点即可，不用重装或重启。
 
-**防循环**：节点间同步推送带一个内部标记，收到后只在本地放行、**不再继续转发**（最多一跳）。
-所以即便两台互相把对方设为子节点，也不会无限互推——可以放心组任意拓扑。
+**防循环**：节点间同步推送带一个内部标记（HTTP 头 `X-Portknock-Sync`），收到后只在本地放行、
+**不再继续转发**（最多一跳）。所以即便两台互相把对方设为子节点，也不会无限互推——可以放心组任意拓扑。
 
 **注意**：
-- 只有**用户自助放行的动态 IP** 会同步；admin 手动加的固定 IP 不同步。
-- 节点间同步走 HTTPS（自签证书），传输已加密。但中心会把子节点的 API 密钥**明文存**进自己的
-  `state.json`（权限 600）——确保中心主机本身安全。
+- 节点间同步的 HTTP 客户端**不校验 TLS 证书**（等同 `curl -k`）。因为每个节点的自签证书只覆盖本机网卡
+  IP，不含公网/NAT IP 或域名，节点间链式校验本就无法成立；身份由 API 密钥（Bearer token）保证，
+  连接仍然是加密的。
+- 中心会把子节点的 API 密钥**明文存**进自己的 `state.json`（权限 600）——确保中心主机本身安全。
 
 ## 手动安装（不装 Go）
 
@@ -253,20 +274,82 @@ GOOS=linux GOARCH=amd64 go build -o portknock .
 | `--api-key` | — | JSON API 的 bearer token（或 `PORTKNOCK_API_KEY`），空则关闭 API |
 | `--grant-pass` | — | 用户页放行口令（或 `PORTKNOCK_GRANT_PASSWORD`），空则无门槛 |
 
-## 实现大概
+## 架构与实现原理
 
-- **状态**（`store.go`）是一个 JSON 文件，记 `ports` / `fixed_ips` / `dynamic`，是唯一事实来源；
-  写入用临时文件加 rename，保证原子。
-- **防火墙**（`firewall.go`）包一层 ufw。每条规则都带注释：IP 放行是 `portknock:dyn:<ip>` /
-  `portknock:fixed:<ip>`（`ufw allow from <ip>`），开放端口是 `portknock:port:<port>`。
-  改动时做 diff，只加缺的、只删多余的，保留的规则不动，避免访问中断。
-- **回收**（`janitor.go`）按 `--poll` 读 conntrack，任何来自动态 IP 的连接都刷新它的 last_seen；
-  空闲超过 `--expiry` 就撤销。IPv6 地址会规范化后再比对，避免展开/压缩格式不一致导致误删。
-- **同步**（`syncer.go`）把动态放行并发推给各子节点的 `/api/grant`，全程后台不阻塞；节点间推送带
-  内部标记，收到不再转发，防止成环。
+单个 Go 二进制，以 root 运行（ufw 需要）。只用标准库，模板用 `//go:embed web/*.html` 打进二进制，
+所以发布就是一个文件。整体是"**JSON 状态是唯一事实来源，ufw 规则是它的纯函数投影**"——
+任何改动先落到 JSON，再把 ufw 收敛到与 JSON 一致。
 
-conntrack 是定时采样的，所以两次采样之间开了又关的连接可能漏掉——但在 48 小时的尺度下无所谓，
-真正活跃的 IP 会在很多次采样里出现。如果内核没加载 conntrack 模块，会退化成纯计时（从放行/上次刷新算 48 小时）。
+### 模块划分
+
+| 文件 | 职责 |
+|------|------|
+| `main.go` | HTTP 服务、路由、配置（flag + 环境变量）、模板渲染、管理台数据组装 |
+| `store.go` | 状态：端口 / 固定 IP / 动态 IP / 子节点；JSON 持久化 + 互斥锁 + 原子写 |
+| `firewall.go` | ufw 封装：放行/撤销、规则 diff 收敛、总开关、IPv6 开关、规则预览 |
+| `janitor.go` | 后台协程：读 conntrack 刷新活动时间、空闲回收、每轮触发同步保活 |
+| `syncer.go` | 把放行并发推送给子节点，记录每个节点的推送状态，防循环 |
+| `auth.go` | 管理会话 cookie、密码常量时间比较、登录失败限速 |
+| `tls.go` | 首次启动生成自签证书（覆盖本机所有网卡 IP），过期自动重建 |
+| `web/*.html` | 用户页、管理台、登录页模板 |
+
+### 状态模型（`store.go`）
+
+状态是一个 JSON 文件（默认 `/var/lib/portknock/state.json`），记四样东西：对外开放端口、
+固定 IP、动态 IP（含首次放行时间 `added_at` 和最后活动时间 `last_seen`）、子节点（地址 + 密钥）。
+所有读写走一把 `sync.Mutex`；写入先写临时文件再 `os.Rename`，保证要么旧的要么新的，不会写坏。
+`Grant` 返回一个"是否新增"标志，让保活重复放行时跳过无谓的 ufw 调用。
+
+### 防火墙层（`firewall.go`）
+
+包一层 `ufw` 命令（用参数切片传，绝不拼 shell 字符串，防注入）。两套规则各自带注释标签：
+
+- IP 放行：`ufw allow from <ip>`，注释 `portknock:dyn:<ip>` 或 `portknock:fixed:<ip>`
+- 开放端口：`ufw allow <port>/tcp`，注释 `portknock:port:<port>`
+
+收敛（`ReconcileAll`）时解析 `ufw status`，把"目标规则集"和"当前带 `portknock:` 注释的规则集"做 diff：
+**先加缺的、再删多余的**，已存在且仍需要的规则一动不动——避免收敛瞬间把正在用的连接掐断。
+注释标签是关键：它让程序能精确认出哪些规则归自己管，不碰用户手工加的其它 ufw 规则。
+
+安装脚本另下的 SSH / 监听端口放行用的是 `portknock-install:` 前缀，**不在**应用管辖范围内，
+所以管理台删不掉、收敛也不会清掉——这是防锁死的保证。
+
+### 活动追踪与回收（`janitor.go`）
+
+48 小时空闲回收是核心。不额外装任何工具，直接读内核 conntrack 表近似"最近连接"：
+
+1. 每 `--poll`（默认 2 分钟）读 `/proc/net/nf_conntrack`（退路 `/proc/net/ip_conntrack`）。
+2. 解析每行的源 IP，命中某个动态 IP 就把它的 `last_seen` 刷成当下。
+3. `now - last_seen > --expiry`（默认 48h）的动态 IP → 撤销 ufw 规则 + 从状态删除。
+   `added_at` 作为 `last_seen` 初值，所以从没用过的放行也会在放行 48 小时后过期。
+
+**已知局限**：两次采样之间开了又关的连接会漏采——但在 48 小时尺度下无所谓，真正活跃的 IP 会在很多次
+采样里出现。内核没加载 conntrack 模块时退化成纯计时（从放行/上次刷新算 48 小时），并在启动时告警。
+
+**IPv6 坑**：conntrack 里 IPv6 是零填充展开式（`240b:4009:0254:...`），Go 规范式是压缩的
+（`240b:4009:254:...`），直接字符串比会误判为"无活动"而误删。所以比对前两边都用 `net.ParseIP`
+规范化。固定 IP 即便也在动态表里，回收时也会跳过撤销（两者可能共享同一条 ufw 规则）。
+
+### 节点同步（`syncer.go`）
+
+把放行并发推给各子节点的 `/api/grant`，**全程后台协程**，HTTP 延迟不阻塞放行处理或 janitor。
+每个子节点一个 goroutine，`WaitGroup` 等全部返回后才取消 context（早取消会把在飞的请求全掐断，
+这是经典的 defer-cancel 坑，特意避开）。推送带 `X-Portknock-Sync` 头，子节点收到只本地放行、
+不再转发——一跳封顶，任意拓扑都不成环。每次推送的成败记进 `status` map，供管理台显示节点健康。
+
+### 客户端 IP 与认证（`main.go` / `auth.go`）
+
+默认取 TCP 对端地址当客户端 IP；只有显式开 `--trust-proxy` 才信 `X-Forwarded-For` 的最后一跳
+（没有可信反代就开 = 让人随便伪造头放行任意 IP）。管理密码常量时间比较，session 存进程内存，
+cookie 带 `Secure`/`HttpOnly`/`SameSite=Strict`，所有改状态的 POST 带 CSRF token（双重提交）。
+登录失败按 IP 累计 5 次锁 5 分钟，挡暴力破解。
+
+### 请求流举例
+
+- **用户放行**：`GET /` 显示检测到的 IP → `POST /grant`（校验 CSRF、可选口令）→ `store.Grant` 落盘 →
+  `firewall.AllowIP` 下发 ufw → `syncer.FanOut` 后台推子节点 → 重定向回首页。
+- **管理台改端口**：`POST /admin/ports` → 前端先 `GET /admin/preview` 弹窗显示规则 diff，确认后才真正
+  提交 → `store.SetPorts` → `firewall.ReconcileAll` 收敛。
 
 ## 安全说明
 
@@ -330,11 +413,15 @@ above for defaults and meaning).
 `Authorization: Bearer <key>` grants the caller's IP (or `{"ip":"..."}`). The
 admin console shows the key and ready-to-run examples.
 
-**Multi-node sync:** in the admin console add other nodes (URL + their API key);
-IPs granted on this node are pushed to them automatically in the background, and
-re-pushed each janitor pass to keep them alive. Inter-node pushes are not
-forwarded again (one-hop cap), so any topology is loop-safe.
+**Multi-node sync:** in the admin console add other nodes (node URL + their API
+key — copy the URL straight from the child's "JSON API" card, no `/api/grant`
+suffix needed). Both user-granted *and* admin-added fixed IPs are pushed to every
+child in the background, and re-pushed each janitor pass to keep them alive. Each
+child's last-push result (ok / failed / never) shows in the table. Inter-node
+pushes carry an `X-Portknock-Sync` header and are not forwarded again (one-hop
+cap), so any topology is loop-safe. The sync HTTP client skips TLS verification
+(like `curl -k`) since each node's self-signed cert can't be chain-verified
+across hosts; the API key provides authentication and the link stays encrypted.
 
 Build from source: `go build -o portknock .` (cross-compile with
 `GOOS=linux GOARCH=amd64`). Run `go test ./...` for the unit tests.
-

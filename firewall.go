@@ -62,6 +62,11 @@ func (f *Firewall) run(args ...string) (string, error) {
 		return "", nil
 	}
 	cmd := exec.Command(f.bin, args...)
+	// Force a C locale so ufw's output (parsed in listManagedRulesLocked and
+	// matched in deleteIPLocked/deletePortLocked) is always English, regardless
+	// of the host's LANG. Otherwise "Status: active" / "Could not delete" checks
+	// break on localized hosts.
+	cmd.Env = append(os.Environ(), "LANG=C", "LC_ALL=C")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -74,9 +79,12 @@ func (f *Firewall) run(args ...string) (string, error) {
 
 // --- Lock-free internal helpers (caller must hold f.mu) ---
 
-// allowIPLocked grants an IP access to all ports.
-func (f *Firewall) allowIPLocked(ip, kind string) error {
-	comment := commentPrefix + kind + ":" + ip
+// allowIPLocked grants an IP access to all ports. The comment is keyed by IP
+// alone ("portknock:ip:<ip>"): ufw keeps only one `allow from <ip>` rule
+// regardless of comment, so fixed and dynamic grants for the same IP must not
+// use distinct comments (that caused reconcile churn and erroneous deletes).
+func (f *Firewall) allowIPLocked(ip string) error {
+	comment := ipRuleKey(ip)
 	_, err := f.run("allow", "from", ip, "comment", comment)
 	return err
 }
@@ -109,10 +117,10 @@ func (f *Firewall) deletePortLocked(port int) error {
 // --- Public operations (each takes f.mu once) ---
 
 // AllowIP grants an IP all-port access.
-func (f *Firewall) AllowIP(ip, kind string) error {
+func (f *Firewall) AllowIP(ip string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.allowIPLocked(ip, kind)
+	return f.allowIPLocked(ip)
 }
 
 // AllowPort opens a TCP port to any source.
@@ -322,28 +330,59 @@ func (f *Firewall) Preview(st State) (current, toAdd, toDelete []string, err err
 	return current, toAdd, toDelete, nil
 }
 
+// allOpenPorts returns the deduped union of all open-port sources: local-only
+// ports, ports this node distributes as a center, and ports received from an
+// upstream center. On a child they all collapse to the same portknock:port:<p>
+// ufw rule, so the firewall only needs the union — the categories matter only
+// in the state layer.
+func allOpenPorts(st State) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, list := range [][]int{st.Ports, st.SyncPorts, st.ReceivedPorts} {
+		for _, p := range list {
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// ipRuleKey is the reconcile key for an IP grant. It is keyed by IP ALONE (not
+// by kind), because ufw collapses `allow from <ip>` to a single physical rule
+// regardless of the comment — so fixed and dynamic grants for the same IP are
+// one rule, and must map to one key, or reconcile would churn (re-add every
+// pass) and, worse, delete the shared rule when only one of the two is dropped.
+func ipRuleKey(ip string) string { return commentPrefix + "ip:" + ip }
+
 // desiredRuleLabels returns, for a prospective state, the set of rules portknock
-// would manage: a map of comment-key -> human-readable label. Invalid entries
-// are skipped (mirrors ReconcileAll's validation).
+// would manage: a map of reconcile-key -> human-readable label. Invalid entries
+// are skipped (mirrors ReconcileAll's validation). An IP that is both fixed and
+// dynamic yields a single entry, labelled as fixed (the stronger, non-expiring
+// grant), since there is only one underlying ufw rule.
 func desiredRuleLabels(st State) map[string]string {
 	m := map[string]string{}
-	for _, p := range st.Ports {
+	for _, p := range allOpenPorts(st) {
 		if p < 1 || p > 65535 {
 			continue
 		}
 		m[commentPrefix+"port:"+fmt.Sprint(p)] = fmt.Sprintf("端口 %d/tcp（对所有人开放）", p)
 	}
-	for _, ip := range st.FixedIPs {
-		if net.ParseIP(ip) == nil {
-			continue
-		}
-		m[commentPrefix+"fixed:"+ip] = fmt.Sprintf("IP %s（固定·全端口）", ip)
-	}
+	// Dynamic first, then fixed, so fixed's label wins on overlap.
 	for _, d := range st.Dynamic {
 		if net.ParseIP(d.IP) == nil {
 			continue
 		}
-		m[commentPrefix+"dyn:"+d.IP] = fmt.Sprintf("IP %s（动态·全端口）", d.IP)
+		m[ipRuleKey(d.IP)] = fmt.Sprintf("IP %s（动态·全端口）", d.IP)
+	}
+	for _, ip := range st.FixedIPs {
+		if net.ParseIP(ip) == nil {
+			continue
+		}
+		m[ipRuleKey(ip)] = fmt.Sprintf("IP %s（固定·全端口）", ip)
 	}
 	return m
 }
@@ -363,8 +402,8 @@ func (f *Firewall) addByKeyLocked(key string) error {
 			return fmt.Errorf("bad port in key %q", key)
 		}
 		return f.allowPortLocked(p)
-	case "fixed", "dyn":
-		return f.allowIPLocked(value, kind)
+	case "ip":
+		return f.allowIPLocked(value)
 	default:
 		return fmt.Errorf("unknown rule kind %q", kind)
 	}
@@ -376,12 +415,14 @@ type managedRule struct {
 	port int    // set for port
 }
 
-// key returns the comment-tag key identifying this rule (matches desiredRuleLabels).
+// key returns the reconcile key identifying this rule (matches desiredRuleLabels).
+// IP grants key by IP alone so fixed/dyn comments on the same physical rule
+// collapse to one key (see ipRuleKey).
 func (r managedRule) key() string {
 	if r.kind == "port" {
 		return commentPrefix + "port:" + fmt.Sprint(r.port)
 	}
-	return commentPrefix + r.kind + ":" + r.ip
+	return ipRuleKey(r.ip)
 }
 
 // label returns a human-readable description of this rule for the UI.
@@ -389,10 +430,8 @@ func (r managedRule) label() string {
 	switch r.kind {
 	case "port":
 		return fmt.Sprintf("端口 %d/tcp（对所有人开放）", r.port)
-	case "fixed":
-		return fmt.Sprintf("IP %s（固定·全端口）", r.ip)
 	default:
-		return fmt.Sprintf("IP %s（动态·全端口）", r.ip)
+		return fmt.Sprintf("IP %s（全端口）", r.ip)
 	}
 }
 
@@ -436,10 +475,14 @@ func parseManagedRules(status string) []managedRule {
 				continue
 			}
 			rules = append(rules, managedRule{kind: "port", port: port})
+		case "ip":
+			rules = append(rules, managedRule{kind: "ip", ip: key})
 		case "dyn", "fixed":
-			rules = append(rules, managedRule{kind: kind, ip: key})
+			// Legacy comment from an older binary (keyed by kind). Still a single
+			// `allow from <ip>` rule — normalize to the IP-only kind so reconcile
+			// matches it and migrates the comment to "ip:" on the next add.
+			rules = append(rules, managedRule{kind: "ip", ip: key})
 		}
 	}
 	return rules
 }
-

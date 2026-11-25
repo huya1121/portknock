@@ -95,10 +95,12 @@ func main() {
 		log.Printf("startup reconcile: %v", err)
 	}
 
-	// Start the janitor.
-	janitor := NewJanitor(store, fw, syncer, cfg.Poll, cfg.Expiry)
+	// Start the janitor (conntrack-based idle expiry) and the syncer keep-alive
+	// loop (re-push whitelist to children on its own, admin-configurable interval).
+	janitor := NewJanitor(store, fw, cfg.Poll, cfg.Expiry)
 	stop := make(chan struct{})
 	go janitor.Run(stop)
+	go syncer.RunKeepAlive(stop, cfg.Poll)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
@@ -107,13 +109,16 @@ func main() {
 	mux.HandleFunc("/admin/login", srv.handleLogin)
 	mux.HandleFunc("/admin/logout", srv.handleLogout)
 	mux.HandleFunc("/admin/ports", srv.handlePorts)
+	mux.HandleFunc("/admin/sync-ports", srv.handleSyncPorts)
 	mux.HandleFunc("/admin/fixed", srv.handleFixed)
 	mux.HandleFunc("/admin/revoke", srv.handleRevoke)
 	mux.HandleFunc("/admin/preview", srv.handlePreview)
 	mux.HandleFunc("/admin/firewall", srv.handleFirewall)
 	mux.HandleFunc("/admin/ipv6", srv.handleIPv6Toggle)
 	mux.HandleFunc("/admin/children", srv.handleChildren)
+	mux.HandleFunc("/admin/sync-interval", srv.handleSyncInterval)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
+	mux.HandleFunc("/api/ports", srv.handleAPIPorts)
 
 	// HTTPS only, with an auto-generated self-signed cert kept next to the state
 	// file. Browsers warn on the self-signed cert, but all traffic (admin
@@ -178,7 +183,8 @@ type indexData struct {
 	Granted    bool
 	Error      string
 	CSRF       string
-	NeedPass   bool // user page should show a password field
+	NeedPass   bool   // user page should show a password field
+	Version    string // build version, shown in the footer
 }
 
 const grantCSRFCookie = "portknock_grant_csrf"
@@ -216,6 +222,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Error:    r.URL.Query().Get("err"),
 		CSRF:     s.grantToken(w, r),
 		NeedPass: s.cfg.GrantPass != "",
+		Version:  version,
 	}
 	s.render(w, "index.html", data)
 }
@@ -239,7 +246,7 @@ func (s *Server) grantDynamic(ip string, fanOut bool) error {
 	// re-push of an already-granted IP) just bumped LastSeen above; re-running
 	// ufw would fork a subprocess and spam an identical log line every poll.
 	if added {
-		if err := s.fw.AllowIP(ip, "dyn"); err != nil {
+		if err := s.fw.AllowIP(ip); err != nil {
 			if rbErr := s.store.RevokeDynamic(ip); rbErr != nil { // keep state consistent with the firewall
 				log.Printf("grant rollback %s: %v", ip, rbErr)
 			}
@@ -325,13 +332,63 @@ func (s *Server) handleAPIGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	// Forward to children UNLESS this request is itself a node-to-node sync push
 	// (marked by the syncer). That one-hop cap is what keeps A⇄B from looping.
-	fanOut := r.Header.Get(syncHeader) == ""
-	if err := s.grantDynamic(ip, fanOut); err != nil {
+	isSync := r.Header.Get(syncHeader) != ""
+	if isSync && s.syncer != nil {
+		// This node is someone's child: remember the pushing center so the admin
+		// UI can show it. Uses the connection IP, not body.IP (that's the grantee).
+		s.syncer.RecordUpstream(s.clientIP(r))
+	}
+	if err := s.grantDynamic(ip, !isSync); err != nil {
 		log.Printf("api grant %s: %v", ip, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ip": ip, "status": "granted"})
+}
+
+// handleAPIPorts is an internal node-to-node endpoint: a center pushes its full
+// sync-port list here and this (child) node opens exactly those ports. It is NOT
+// a public API — it requires both the API key AND the sync header, so it can
+// only be driven by another portknock node's syncer, never by an outside caller.
+//
+//	POST /api/ports   Authorization: Bearer <key>   X-Portknock-Sync: 1
+//	{"ports":[8000,9000]}
+func (s *Server) handleAPIPorts(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.APIKey == "" {
+		http.Error(w, "api disabled", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.checkAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	// Internal-only: must come from a node-to-node sync push.
+	if r.Header.Get(syncHeader) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
+		return
+	}
+	var body struct {
+		Ports []int `json:"ports"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	}
+	if s.syncer != nil {
+		s.syncer.RecordUpstream(s.clientIP(r))
+	}
+	if err := s.store.SetReceivedPorts(body.Ports); err != nil {
+		log.Printf("api ports: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
+		log.Printf("reconcile after received-ports change: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ports": s.store.Snapshot().ReceivedPorts, "status": "ok"})
 }
 
 // checkAPIKey validates the bearer token in constant time.
@@ -353,9 +410,12 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // --- Admin handlers ---
 
 type adminData struct {
-	CSRF       string
-	Ports      []int
-	PortsStr   string
+	CSRF         string
+	Ports        []int
+	PortsStr     string
+	SyncPorts    []int  // ports distributed to children (center side)
+	SyncPortsStr string // comma-joined, for the form input
+	ReceivedPorts []int // ports received from an upstream center (child side)
 	FixedIPs   []fixedView
 	Dynamic    []dynView
 	DryRun     bool
@@ -368,8 +428,12 @@ type adminData struct {
 	FWActive    bool // whether ufw is currently enabled
 	IPv6Managed bool // whether ufw manages IPv6 (IPV6=yes)
 	Children    []childView
-	APIKey      string // JSON API bearer token ("" = API disabled)
-	APIBase     string // base URL for API examples, e.g. http://host:8080
+	Upstreams   []upstreamView // centers that push sync grants to this node
+	SyncInterval    string     // human-readable keep-alive interval, e.g. "2分钟"
+	SyncIntervalSec int        // the same as seconds, for the form input value
+	APIKey      string         // JSON API bearer token ("" = API disabled)
+	APIBase     string         // base URL for API examples, e.g. http://host:8080
+	Version     string         // build version, shown in the footer
 }
 
 // childView is a child node plus its last-sync status, for the admin table.
@@ -377,6 +441,12 @@ type childView struct {
 	URL    string
 	Status string // "ok" | "fail" | "unknown"
 	Detail string // human-readable last-sync info
+}
+
+// upstreamView is an upstream center (a node that has pushed sync grants to us).
+type upstreamView struct {
+	IP     string
+	Detail string // humanized "last pushed X ago"
 }
 
 type fixedView struct {
@@ -428,6 +498,10 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	portStrs := make([]string, len(st.Ports))
 	for i, p := range st.Ports {
 		portStrs[i] = strconv.Itoa(p)
+	}
+	syncPortStrs := make([]string, len(st.SyncPorts))
+	for i, p := range st.SyncPorts {
+		syncPortStrs[i] = strconv.Itoa(p)
 	}
 
 	// Is the admin's IP permanently reachable? (fixed whitelist entry).
@@ -484,6 +558,18 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		children = append(children, cv)
 	}
 
+	// Upstream centers (nodes that have pushed sync grants to us) — tells the
+	// admin of a child node who it is downstream of.
+	upMap := s.syncer.Upstreams()
+	upstreams := make([]upstreamView, 0, len(upMap))
+	for ip, when := range upMap {
+		upstreams = append(upstreams, upstreamView{
+			IP:     ip,
+			Detail: "最近 " + when.Local().Format("01-02 15:04") + "（" + humanizeDuration(now.Sub(when).Truncate(time.Second)) + "前）推送",
+		})
+	}
+	sort.Slice(upstreams, func(i, j int) bool { return upstreams[i].IP < upstreams[j].IP })
+
 	// Base URL for API examples: derive scheme from how we're reached.
 	scheme := "http"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
@@ -491,10 +577,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	apiBase := scheme + "://" + r.Host
 
+	syncIv := s.store.SyncIntervalOr(s.cfg.Poll)
+
 	s.render(w, "admin.html", adminData{
-		CSRF:       s.auth.CSRF(r),
-		Ports:      st.Ports,
-		PortsStr:   strings.Join(portStrs, ", "),
+		CSRF:          s.auth.CSRF(r),
+		Ports:         st.Ports,
+		PortsStr:      strings.Join(portStrs, ", "),
+		SyncPorts:     st.SyncPorts,
+		SyncPortsStr:  strings.Join(syncPortStrs, ", "),
+		ReceivedPorts: st.ReceivedPorts,
 		FixedIPs:   fixed,
 		Dynamic:    dyn,
 		DryRun:     s.cfg.DryRun,
@@ -507,8 +598,12 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		FWActive:    s.fw.IsActive(),
 		IPv6Managed: s.fw.IPv6Managed(),
 		Children:    children,
+		Upstreams:   upstreams,
+		SyncInterval:    humanizeDuration(syncIv),
+		SyncIntervalSec: int(syncIv.Seconds()),
 		APIKey:      s.cfg.APIKey,
 		APIBase:     apiBase,
+		Version:     version,
 	})
 }
 
@@ -584,6 +679,28 @@ func (s *Server) handlePorts(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
+// handleSyncPorts sets the open ports this node distributes to its children.
+// They're opened locally too, and pushed to every child immediately.
+func (s *Server) handleSyncPorts(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	ports := parsePorts(r.FormValue("ports"))
+	if err := s.store.SetSyncPorts(ports); err != nil {
+		log.Printf("set sync ports: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
+		log.Printf("reconcile after sync-ports change: %v", err)
+	}
+	// Push the new list to children right away (don't wait for the janitor pass).
+	if s.syncer != nil {
+		s.syncer.FanOutPorts()
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
 func (s *Server) handleFixed(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -655,6 +772,41 @@ func (s *Server) handleChildren(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// Newly added child: immediately push the full current whitelist to it in the
+	// background, so it's in sync within seconds instead of waiting for the next
+	// janitor keep-alive pass.
+	if action == "add" && s.syncer != nil {
+		s.syncer.FanOutAll()
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleSyncInterval sets the child keep-alive re-push interval. Accepts a plain
+// number of seconds or a Go duration (e.g. "30s", "2m"); clamped to [10s, 24h].
+// Takes effect on the syncer's next keep-alive tick (no restart needed).
+func (s *Server) handleSyncInterval(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	raw := strings.TrimSpace(r.FormValue("interval"))
+	var d time.Duration
+	if n, err := strconv.Atoi(raw); err == nil {
+		d = time.Duration(n) * time.Second // bare number = seconds
+	} else if pd, err := time.ParseDuration(raw); err == nil {
+		d = pd
+	} else {
+		http.Error(w, "间隔格式无效（填秒数，或如 30s / 2m）", http.StatusBadRequest)
+		return
+	}
+	if d > 24*time.Hour {
+		d = 24 * time.Hour
+	}
+	// SetSyncInterval clamps the lower bound to 10s.
+	if err := s.store.SetSyncInterval(d); err != nil {
+		log.Printf("set sync interval: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
@@ -698,23 +850,17 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // identically.
 func prospectiveState(cur State, action, value string) (State, error) {
 	next := State{
-		Ports:    append([]int(nil), cur.Ports...),
-		FixedIPs: append([]string(nil), cur.FixedIPs...),
-		Dynamic:  append([]Dynamic(nil), cur.Dynamic...),
+		Ports:         append([]int(nil), cur.Ports...),
+		FixedIPs:      append([]string(nil), cur.FixedIPs...),
+		Dynamic:       append([]Dynamic(nil), cur.Dynamic...),
+		SyncPorts:     append([]int(nil), cur.SyncPorts...),
+		ReceivedPorts: append([]int(nil), cur.ReceivedPorts...),
 	}
 	switch action {
 	case "ports":
-		seen := map[int]bool{}
-		clean := []int{}
-		for _, p := range parsePorts(value) {
-			if p < 1 || p > 65535 || seen[p] {
-				continue
-			}
-			seen[p] = true
-			clean = append(clean, p)
-		}
-		sort.Ints(clean)
-		next.Ports = clean
+		next.Ports = cleanPorts(parsePorts(value))
+	case "sync-ports":
+		next.SyncPorts = cleanPorts(parsePorts(value))
 	case "fixed-add":
 		ip := canonicalIP(value)
 		if ip == "" {
@@ -855,4 +1001,3 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 		log.Printf("render %s: %v", name, err)
 	}
 }
-

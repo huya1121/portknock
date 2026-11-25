@@ -20,15 +20,14 @@ var conntrackPaths = []string{
 type Janitor struct {
 	store   *Store
 	fw      *Firewall
-	syncer  *Syncer // may be nil; used to keep children alive
 	poll    time.Duration
 	window  time.Duration
 	nowFn   func() time.Time
 	hasConn bool // whether a conntrack source is readable
 }
 
-func NewJanitor(store *Store, fw *Firewall, syncer *Syncer, poll, window time.Duration) *Janitor {
-	j := &Janitor{store: store, fw: fw, syncer: syncer, poll: poll, window: window, nowFn: time.Now}
+func NewJanitor(store *Store, fw *Firewall, poll, window time.Duration) *Janitor {
+	j := &Janitor{store: store, fw: fw, poll: poll, window: window, nowFn: time.Now}
 	j.hasConn = conntrackReadable()
 	if !j.hasConn {
 		log.Printf("warning: no readable conntrack table (%v); dynamic IPs will expire %s after grant/last refresh regardless of activity",
@@ -100,11 +99,6 @@ func (j *Janitor) tick() {
 		}
 	}
 
-	// Keep child nodes alive: re-push every surviving dynamic IP so downstream
-	// nodes don't expire them on their own idle timer.
-	if j.syncer != nil {
-		j.syncer.FanOutAll()
-	}
 }
 
 func readFirst(paths []string) (string, error) {
@@ -176,4 +170,3 @@ func firstValue(line, key string) string {
 	}
 	return rest
 }
-

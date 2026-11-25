@@ -11,11 +11,14 @@ import (
 
 const sessionCookie = "portknock_session"
 
-// Brute-force limits: after maxFails failed logins from one IP within the
-// window, that IP is locked out for lockDuration.
+// Brute-force limits: after maxFails failed logins from one IP within failWindow,
+// that IP is locked out for lockDuration. Failures older than failWindow decay
+// (the counter restarts), so a legitimate admin who mistypes occasionally over a
+// long span is never locked out.
 const (
 	maxFails     = 5
 	lockDuration = 5 * time.Minute
+	failWindow   = 15 * time.Minute
 )
 
 // Auth manages the single admin password and in-memory session tokens, plus a
@@ -35,6 +38,7 @@ type session struct {
 
 type failInfo struct {
 	count  int
+	first  time.Time // when the current counting window started
 	locked time.Time // time until which the IP is locked (zero = not locked)
 }
 
@@ -58,17 +62,39 @@ func (a *Auth) Locked(ip string) (bool, time.Duration) {
 	return true, time.Until(f.locked).Round(time.Second)
 }
 
-// RecordFail notes a failed login from ip and locks it once over the threshold.
+// RecordFail notes a failed login from ip and locks it once maxFails is reached
+// within failWindow. Failures older than failWindow decay (counter restarts).
 func (a *Auth) RecordFail(ip string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := time.Now()
+	a.sweepFailsLocked(now)
 	f := a.fails[ip]
+	// Start a fresh window if this is the first failure or the previous window
+	// has elapsed.
+	if f.count == 0 || now.Sub(f.first) > failWindow {
+		f.first = now
+		f.count = 0
+	}
 	f.count++
 	if f.count >= maxFails {
-		f.locked = time.Now().Add(lockDuration)
+		f.locked = now.Add(lockDuration)
 		f.count = 0 // reset counter; the lock itself now gates access
 	}
 	a.fails[ip] = f
+}
+
+// sweepFailsLocked drops fail entries that are neither locked nor within an
+// active counting window, so the map can't grow unbounded under IP rotation.
+// Caller must hold a.mu.
+func (a *Auth) sweepFailsLocked(now time.Time) {
+	for ip, f := range a.fails {
+		lockedActive := !f.locked.IsZero() && now.Before(f.locked)
+		windowActive := f.count > 0 && now.Sub(f.first) <= failWindow
+		if !lockedActive && !windowActive {
+			delete(a.fails, ip)
+		}
+	}
 }
 
 // RecordSuccess clears any failure state for ip after a good login.
@@ -160,4 +186,3 @@ func (a *Auth) Logout(r *http.Request) {
 	delete(a.sessions, c.Value)
 	a.mu.Unlock()
 }
-

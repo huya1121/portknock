@@ -83,6 +83,15 @@ func TestProspectiveState(t *testing.T) {
 		t.Errorf("ports: got %v err %v", next.Ports, err)
 	}
 
+	// sync-ports replace (independent of local Ports)
+	next, err = prospectiveState(cur, "sync-ports", "9000, 8000, 8000")
+	if err != nil || !reflect.DeepEqual(next.SyncPorts, []int{8000, 9000}) {
+		t.Errorf("sync-ports: got %v err %v", next.SyncPorts, err)
+	}
+	if !reflect.DeepEqual(next.Ports, []int{80}) {
+		t.Errorf("sync-ports must not touch local Ports: got %v", next.Ports)
+	}
+
 	// fixed-add canonicalizes and dedups
 	next, _ = prospectiveState(cur, "fixed-add", "2001:0db8::1")
 	if !reflect.DeepEqual(next.FixedIPs, []string{"2001:db8::1", "203.0.113.5"}) {
