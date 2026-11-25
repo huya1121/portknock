@@ -20,8 +20,8 @@ import (
 // Access model (two independent rule families):
 //   - IP grants (kind "dyn"/"fixed"): `ufw allow from <ip>` — the IP may reach
 //     ALL ports on the host.
-//   - Open ports (kind "port"): `ufw allow <port>/tcp` — the port is reachable
-//     from ANY source.
+//   - Open ports (kind "port"): `ufw allow <port>` — the port is reachable from
+//     ANY source, on BOTH TCP and UDP (bare port = both protocols in ufw).
 type Firewall struct {
 	dryRun bool
 	bin    string     // resolved absolute path to the ufw binary
@@ -98,16 +98,24 @@ func (f *Firewall) deleteIPLocked(ip string) error {
 	return nil
 }
 
-// allowPortLocked opens a TCP port to any source.
+// allowPortLocked opens a port to any source for BOTH TCP and UDP. Passing the
+// bare port number (no "/tcp") makes ufw add both protocols in one rule.
 func (f *Firewall) allowPortLocked(port int) error {
 	comment := commentPrefix + "port:" + fmt.Sprint(port)
-	_, err := f.run("allow", fmt.Sprintf("%d/tcp", port), "comment", comment)
+	_, err := f.run("allow", fmt.Sprint(port), "comment", comment)
 	return err
 }
 
-// deletePortLocked closes a previously-opened TCP port (idempotent).
-func (f *Firewall) deletePortLocked(port int) error {
-	out, err := f.run("delete", "allow", fmt.Sprintf("%d/tcp", port))
+// deletePortLocked closes a previously-opened port (idempotent). proto is "" for
+// a both-protocols rule, or "tcp"/"udp" to delete a proto-specific rule (e.g. a
+// tcp-only rule left by an older binary, during migration). The spec must match
+// how the rule was added or ufw won't find it.
+func (f *Firewall) deletePortLocked(port int, proto string) error {
+	spec := fmt.Sprint(port)
+	if proto != "" {
+		spec = fmt.Sprintf("%d/%s", port, proto)
+	}
+	out, err := f.run("delete", "allow", spec)
 	if err != nil && !strings.Contains(strings.ToLower(out), "could not delete") {
 		return err
 	}
@@ -284,7 +292,7 @@ func (f *Firewall) reconcileLocked(st State) error {
 			continue
 		}
 		if r.kind == "port" {
-			if err := f.deletePortLocked(r.port); err != nil {
+			if err := f.deletePortLocked(r.port, r.proto); err != nil {
 				log.Printf("reconcile: delete port %d: %v", r.port, err)
 			}
 		} else {
@@ -369,7 +377,7 @@ func desiredRuleLabels(st State) map[string]string {
 		if p < 1 || p > 65535 {
 			continue
 		}
-		m[commentPrefix+"port:"+fmt.Sprint(p)] = fmt.Sprintf("端口 %d/tcp（对所有人开放）", p)
+		m[portRuleKey(p, "")] = fmt.Sprintf("端口 %d（TCP+UDP，对所有人开放）", p)
 	}
 	// Dynamic first, then fixed, so fixed's label wins on overlap.
 	for _, d := range st.Dynamic {
@@ -410,26 +418,41 @@ func (f *Firewall) addByKeyLocked(key string) error {
 }
 
 type managedRule struct {
-	kind string // "dyn", "fixed", or "port"
-	ip   string // set for dyn/fixed
-	port int    // set for port
+	kind  string // "ip" or "port"
+	ip    string // set for ip
+	port  int    // set for port
+	proto string // port only: "" = both tcp+udp, or "tcp"/"udp" for a proto-specific rule
 }
 
 // key returns the reconcile key identifying this rule (matches desiredRuleLabels).
 // IP grants key by IP alone so fixed/dyn comments on the same physical rule
-// collapse to one key (see ipRuleKey).
+// collapse to one key (see ipRuleKey). Port rules include the protocol so a
+// legacy tcp-only rule (older binary) does NOT match the desired both-protocol
+// rule — reconcile then deletes the tcp-only one and re-adds it for tcp+udp.
 func (r managedRule) key() string {
 	if r.kind == "port" {
-		return commentPrefix + "port:" + fmt.Sprint(r.port)
+		return portRuleKey(r.port, r.proto)
 	}
 	return ipRuleKey(r.ip)
+}
+
+// portRuleKey keys a port rule. proto "" (both tcp+udp) is the desired form.
+func portRuleKey(port int, proto string) string {
+	k := commentPrefix + "port:" + fmt.Sprint(port)
+	if proto != "" {
+		k += "/" + proto
+	}
+	return k
 }
 
 // label returns a human-readable description of this rule for the UI.
 func (r managedRule) label() string {
 	switch r.kind {
 	case "port":
-		return fmt.Sprintf("端口 %d/tcp（对所有人开放）", r.port)
+		if r.proto != "" {
+			return fmt.Sprintf("端口 %d/%s（对所有人开放）", r.port, r.proto)
+		}
+		return fmt.Sprintf("端口 %d（TCP+UDP，对所有人开放）", r.port)
 	default:
 		return fmt.Sprintf("IP %s（全端口）", r.ip)
 	}
@@ -449,10 +472,14 @@ func (f *Firewall) listManagedRulesLocked() ([]managedRule, error) {
 }
 
 // parseManagedRules extracts managed rules from `ufw status` output. Lines carry
-// a comment "portknock:<kind>:<key>". Split out for testability.
+// a comment "portknock:<kind>:<key>". Split out for testability. For port rules
+// the protocol is read from the "To" column (first field): "8000/tcp" / "8000/udp"
+// are proto-specific; a bare "8000" means both tcp+udp. This lets reconcile tell
+// a legacy tcp-only rule apart from the desired both-protocol rule and migrate it.
 //
-//	Anywhere         ALLOW   1.2.3.4        # portknock:dyn:1.2.3.4
-//	80/tcp           ALLOW   Anywhere       # portknock:port:80
+//	Anywhere         ALLOW   1.2.3.4        # portknock:ip:1.2.3.4
+//	8000             ALLOW   Anywhere       # portknock:port:8000   (tcp+udp)
+//	80/tcp           ALLOW   Anywhere       # portknock:port:80     (legacy tcp-only)
 func parseManagedRules(status string) []managedRule {
 	var rules []managedRule
 	sc := bufio.NewScanner(strings.NewReader(status))
@@ -474,7 +501,15 @@ func parseManagedRules(status string) []managedRule {
 			if _, err := fmt.Sscanf(key, "%d", &port); err != nil {
 				continue
 			}
-			rules = append(rules, managedRule{kind: "port", port: port})
+			// Determine protocol from the "To" column (first whitespace field),
+			// e.g. "8000/tcp" -> "tcp", "8000" -> "" (both). (v6) suffix ignored.
+			proto := ""
+			if fields := strings.Fields(line); len(fields) > 0 {
+				if _, p, ok := strings.Cut(fields[0], "/"); ok {
+					proto = p
+				}
+			}
+			rules = append(rules, managedRule{kind: "port", port: port, proto: proto})
 		case "ip":
 			rules = append(rules, managedRule{kind: "ip", ip: key})
 		case "dyn", "fixed":

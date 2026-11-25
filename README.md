@@ -15,7 +15,7 @@
 两套互不相干的规则：
 
 - **白名单 IP**（固定的或用户自助提交的）：这个 IP 能访问本机**所有端口**（`ufw allow from <ip>`）。
-- **开放端口**：这个 TCP 端口对**任何来源**开放（`ufw allow <port>/tcp`）。
+- **开放端口**：这个端口对**任何来源**开放，**TCP 和 UDP 都放**（`ufw allow <port>`，裸端口号即双协议）。
 
 三个页面/行为：
 
@@ -227,8 +227,14 @@ curl -k -X POST https://host/api/grant \
 注意这只影响"保活重推"频率——新放行/改动本来就会立即推送。间隔存进 `state.json`，与 conntrack 回收采样
 （`--poll`）相互独立。
 
-**角色随时切换**：每台跑的都是同一个二进制，配了子节点就是中心、没配就是普通节点，在管理台
-加/删子节点即可，不用重装或重启。
+**节点模式（中心 / 子节点，可自由切换）**：集群页有「节点模式」卡片，三选一：
+- **自动**（默认）：没有上游推送过来就按中心处理；一旦检测到有上游节点在推送，就自动按子节点处理。
+- **强制中心**：始终显示中心控制菜单并向下游同步。
+- **强制子节点**：隐藏所有中心控制菜单（添加子节点、同步端口、保活间隔），并**停止向下游同步**——
+  本机只做接收上游推送的叶子节点。
+
+切到子节点模式只是改变角色与 UI，不删除已配的子节点/同步端口数据；切回中心即恢复。每台跑的都是同一个
+二进制，角色随时在管理台切换，不用重装或重启。
 
 **防循环**：节点间同步推送带一个内部标记（HTTP 头 `X-Portknock-Sync`），收到后只在本地放行、
 **不再继续转发**（最多一跳）。所以即便两台互相把对方设为子节点，也不会无限互推——可以放心组任意拓扑。
@@ -380,8 +386,8 @@ IPs are permanently trusted. Single static binary, standard library only,
 
 **Access model** — two independent rule families: a whitelisted IP (fixed or
 user-submitted) reaches *all* ports (`ufw allow from <ip>`); a whitelisted port
-is open to *any* source (`ufw allow <port>/tcp`). User-submitted IPs expire after
-48h with no connection activity; fixed IPs never do.
+is open to *any* source on both TCP and UDP (`ufw allow <port>`). User-submitted
+IPs expire after 48h with no connection activity; fixed IPs never do.
 
 **Install:**
 

@@ -117,6 +117,7 @@ func main() {
 	mux.HandleFunc("/admin/ipv6", srv.handleIPv6Toggle)
 	mux.HandleFunc("/admin/children", srv.handleChildren)
 	mux.HandleFunc("/admin/sync-interval", srv.handleSyncInterval)
+	mux.HandleFunc("/admin/node-mode", srv.handleNodeMode)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 	mux.HandleFunc("/api/ports", srv.handleAPIPorts)
 
@@ -429,6 +430,9 @@ type adminData struct {
 	IPv6Managed bool // whether ufw manages IPv6 (IPV6=yes)
 	Children    []childView
 	Upstreams   []upstreamView // centers that push sync grants to this node
+	IsCenter    bool           // effective role is center -> show center controls
+	NodeMode    string         // raw override: "center" | "child" | "" (auto)
+	HasUpstream bool           // some upstream has pushed to us (for auto-mode hint)
 	SyncInterval    string     // human-readable keep-alive interval, e.g. "2分钟"
 	SyncIntervalSec int        // the same as seconds, for the form input value
 	APIKey      string         // JSON API bearer token ("" = API disabled)
@@ -578,6 +582,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	apiBase := scheme + "://" + r.Host
 
 	syncIv := s.store.SyncIntervalOr(s.cfg.Poll)
+	isCenter := s.syncer.EffectiveMode() == "center"
 
 	s.render(w, "admin.html", adminData{
 		CSRF:          s.auth.CSRF(r),
@@ -599,6 +604,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		IPv6Managed: s.fw.IPv6Managed(),
 		Children:    children,
 		Upstreams:   upstreams,
+		IsCenter:    isCenter,
+		NodeMode:    st.NodeMode,
+		HasUpstream: len(upstreams) > 0,
 		SyncInterval:    humanizeDuration(syncIv),
 		SyncIntervalSec: int(syncIv.Seconds()),
 		APIKey:      s.cfg.APIKey,
@@ -805,6 +813,20 @@ func (s *Server) handleSyncInterval(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.SetSyncInterval(d); err != nil {
 		log.Printf("set sync interval: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleNodeMode sets the node role override: "center", "child", or "" (auto).
+// Switching to child mode stops outbound sync (enforced in the syncer).
+func (s *Server) handleNodeMode(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	mode := strings.TrimSpace(r.FormValue("mode"))
+	if err := s.store.SetNodeMode(mode); err != nil {
+		http.Error(w, "无效的节点模式", http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)

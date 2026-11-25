@@ -42,6 +42,11 @@ type State struct {
 	// duration string (e.g. "2m", "30s"). Empty = default. Configurable from the
 	// admin UI; the syncer's keep-alive loop reads it each pass.
 	SyncInterval string `json:"sync_interval"`
+	// NodeMode is the admin's explicit role override: "center" (always act as a
+	// center: show center controls, fan out to children), "child" (act as a child:
+	// hide center controls, stop fanning out), or "" (auto: child-like once some
+	// upstream has pushed to us, center-like otherwise).
+	NodeMode string `json:"node_mode"`
 }
 
 // Store guards State with a mutex and persists it atomically to disk.
@@ -102,6 +107,7 @@ func (s *Store) copyLocked() State {
 		SyncPorts:     append([]int(nil), s.state.SyncPorts...),
 		ReceivedPorts: append([]int(nil), s.state.ReceivedPorts...),
 		SyncInterval:  s.state.SyncInterval,
+		NodeMode:      s.state.NodeMode,
 	}
 	return cp
 }
@@ -210,6 +216,19 @@ func (s *Store) SyncIntervalOr(def time.Duration) time.Duration {
 		d = minSyncInterval
 	}
 	return d
+}
+
+// SetNodeMode sets the role override: "center", "child", or "" (auto).
+func (s *Store) SetNodeMode(mode string) error {
+	switch mode {
+	case "", "center", "child":
+	default:
+		return fmt.Errorf("invalid node mode %q", mode)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.NodeMode = mode
+	return s.persistLocked()
 }
 
 // AddChild adds (or updates the key of) a downstream node, keyed by URL.

@@ -198,6 +198,9 @@ func (s *Syncer) pushPortsOne(ctx context.Context, c Child, ports []int) error {
 // background. Declarative/full-list: a child replaces its received ports with
 // exactly this set, so a port removed at the center closes on the child too.
 func (s *Syncer) FanOutPorts() {
+	if !s.syncingEnabled() {
+		return
+	}
 	st := s.store.Snapshot()
 	if len(st.Children) == 0 {
 		return
@@ -243,8 +246,41 @@ func (s *Syncer) RunKeepAlive(stop <-chan struct{}, defInterval time.Duration) {
 	}
 }
 
+// hasUpstream reports whether any upstream center has ever pushed to this node.
+func (s *Syncer) hasUpstream() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.upstreams) > 0
+}
+
+// EffectiveMode resolves the node's role, combining the admin's explicit override
+// (store.NodeMode) with auto-detection: "center" or "child". In auto mode ("")
+// the node is a child once some upstream has pushed to it, else a center.
+func (s *Syncer) EffectiveMode() string {
+	switch s.store.Snapshot().NodeMode {
+	case "center":
+		return "center"
+	case "child":
+		return "child"
+	default: // auto
+		if s.hasUpstream() {
+			return "child"
+		}
+		return "center"
+	}
+}
+
+// syncingEnabled reports whether this node should fan out to children. A node in
+// (effective) child mode stops all outbound sync — it is a leaf, not a relay.
+func (s *Syncer) syncingEnabled() bool {
+	return s.EffectiveMode() == "center"
+}
+
 // FanOut pushes one ip to all configured children in the background.
 func (s *Syncer) FanOut(ip string) {
+	if !s.syncingEnabled() {
+		return
+	}
 	children := s.store.Snapshot().Children
 	if len(children) == 0 {
 		return
@@ -256,6 +292,9 @@ func (s *Syncer) FanOut(ip string) {
 // so children keep them alive (the janitor calls this each pass). Snapshots
 // once and does a single batched background fan-out.
 func (s *Syncer) FanOutAll() {
+	if !s.syncingEnabled() {
+		return
+	}
 	st := s.store.Snapshot()
 	if len(st.Children) == 0 {
 		return
