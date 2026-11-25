@@ -1,4 +1,4 @@
-package main
+ckage main
 
 import (
 	"crypto/subtle"
@@ -367,9 +367,16 @@ type adminData struct {
 	NumDynamic int
 	FWActive    bool // whether ufw is currently enabled
 	IPv6Managed bool // whether ufw manages IPv6 (IPV6=yes)
-	Children    []Child
+	Children    []childView
 	APIKey      string // JSON API bearer token ("" = API disabled)
 	APIBase     string // base URL for API examples, e.g. http://host:8080
+}
+
+// childView is a child node plus its last-sync status, for the admin table.
+type childView struct {
+	URL    string
+	Status string // "ok" | "fail" | "unknown"
+	Detail string // human-readable last-sync info
 }
 
 type fixedView struct {
@@ -459,6 +466,24 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(dyn, func(i, j int) bool { return dyn[i].IP < dyn[j].IP })
 
+	// Child nodes + their last-sync status.
+	syncStatus := s.syncer.Status()
+	children := make([]childView, 0, len(st.Children))
+	for _, c := range st.Children {
+		cv := childView{URL: c.URL, Status: "unknown", Detail: "尚未推送"}
+		if st, ok := syncStatus[c.URL]; ok {
+			when := st.When.Local().Format("01-02 15:04")
+			if st.OK {
+				cv.Status = "ok"
+				cv.Detail = "最近同步 " + when + " 成功"
+			} else {
+				cv.Status = "fail"
+				cv.Detail = "最近同步 " + when + " 失败：" + st.Err
+			}
+		}
+		children = append(children, cv)
+	}
+
 	// Base URL for API examples: derive scheme from how we're reached.
 	scheme := "http"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
@@ -481,7 +506,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		NumDynamic: len(st.Dynamic),
 		FWActive:    s.fw.IsActive(),
 		IPv6Managed: s.fw.IPv6Managed(),
-		Children:    st.Children,
+		Children:    children,
 		APIKey:      s.cfg.APIKey,
 		APIBase:     apiBase,
 	})
@@ -586,6 +611,12 @@ func (s *Server) handleFixed(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
 		log.Printf("reconcile after fixed change: %v", err)
+	}
+	// Adding a fixed IP also fans it out to child nodes (they grant it as a
+	// dynamic IP, kept alive by the janitor). Removal is not propagated — child
+	// grants simply idle out on their own.
+	if action == "add" && s.syncer != nil {
+		s.syncer.FanOut(ip)
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }

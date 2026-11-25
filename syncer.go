@@ -16,20 +16,52 @@ import (
 // grants locally but does NOT forward it again (one-hop cap = loop-safe).
 const syncHeader = "X-Portknock-Sync"
 
+// ChildStatus is the outcome of the last push to a child node, shown in admin.
+type ChildStatus struct {
+	OK   bool      // last push succeeded
+	When time.Time // when that last push happened (zero = never tried)
+	Err  string    // short error if the last push failed
+}
+
 // Syncer fans dynamic grants out to downstream ("child") portknock nodes by
 // calling their /api/grant endpoint. It is best-effort: failures are logged,
 // never block the local grant, and get another chance on the next janitor
-// keep-alive pass.
+// keep-alive pass. It also records each child's last-push result for the UI.
 type Syncer struct {
 	store  *Store
 	client *http.Client
+	mu     sync.Mutex
+	status map[string]ChildStatus // child URL -> last push result
 }
 
 func NewSyncer(store *Store) *Syncer {
 	return &Syncer{
 		store:  store,
 		client: &http.Client{Timeout: 10 * time.Second},
+		status: map[string]ChildStatus{},
 	}
+}
+
+// Status returns a copy of the last-push result for each child URL.
+func (s *Syncer) Status() map[string]ChildStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]ChildStatus, len(s.status))
+	for k, v := range s.status {
+		out[k] = v
+	}
+	return out
+}
+
+// record stores the outcome of a push to url.
+func (s *Syncer) record(url string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := ChildStatus{OK: err == nil, When: time.Now()}
+	if err != nil {
+		st.Err = err.Error()
+	}
+	s.status[url] = st
 }
 
 // pushOne grants ip on a single child node. Returns nil on a 2xx "granted".
@@ -65,18 +97,26 @@ func (s *Syncer) pushToChildren(children []Child, ips []string) {
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, c := range children {
-		for _, ip := range ips {
-			wg.Add(1)
-			c, ip := c, ip
-			go func() {
-				defer wg.Done()
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Push all IPs to this child in sequence; record one status for the
+			// child (fails if any IP push fails — usually means it's unreachable).
+			var firstErr error
+			for _, ip := range ips {
 				if err := s.pushOne(ctx, c, ip); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
 					log.Printf("sync: push %s -> %s: %v", ip, c.URL, err)
-				} else {
-					log.Printf("sync: pushed %s -> %s", ip, c.URL)
 				}
-			}()
-		}
+			}
+			s.record(c.URL, firstErr)
+			if firstErr == nil {
+				log.Printf("sync: pushed %d IP(s) -> %s", len(ips), c.URL)
+			}
+		}()
 	}
 	wg.Wait()
 }
@@ -90,17 +130,21 @@ func (s *Syncer) FanOut(ip string) {
 	go s.pushToChildren(children, []string{ip})
 }
 
-// FanOutAll re-pushes every currently-granted dynamic IP to all children (the
-// janitor calls this each pass so children keep the IPs alive). Snapshots once
-// and does a single batched background fan-out.
+// FanOutAll re-pushes every whitelisted IP (dynamic + fixed) to all children,
+// so children keep them alive (the janitor calls this each pass). Snapshots
+// once and does a single batched background fan-out.
 func (s *Syncer) FanOutAll() {
 	st := s.store.Snapshot()
-	if len(st.Children) == 0 || len(st.Dynamic) == 0 {
+	if len(st.Children) == 0 {
 		return
 	}
-	ips := make([]string, 0, len(st.Dynamic))
+	ips := make([]string, 0, len(st.Dynamic)+len(st.FixedIPs))
 	for _, d := range st.Dynamic {
 		ips = append(ips, d.IP)
+	}
+	ips = append(ips, st.FixedIPs...)
+	if len(ips) == 0 {
+		return
 	}
 	go s.pushToChildren(st.Children, ips)
 }
