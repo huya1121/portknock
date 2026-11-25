@@ -47,6 +47,10 @@ type State struct {
 	// hide center controls, stop fanning out), or "" (auto: child-like once some
 	// upstream has pushed to us, center-like otherwise).
 	NodeMode string `json:"node_mode"`
+	// AllowRemoteUpgrade gates the /api/upgrade endpoint. Default false: even with
+	// a valid API key + sync header, a center cannot remotely trigger this node to
+	// re-download and restart unless the admin has explicitly opted in here.
+	AllowRemoteUpgrade bool `json:"allow_remote_upgrade"`
 }
 
 // Store guards State with a mutex and persists it atomically to disk.
@@ -108,6 +112,7 @@ func (s *Store) copyLocked() State {
 		ReceivedPorts: append([]int(nil), s.state.ReceivedPorts...),
 		SyncInterval:  s.state.SyncInterval,
 		NodeMode:      s.state.NodeMode,
+		AllowRemoteUpgrade: s.state.AllowRemoteUpgrade,
 	}
 	return cp
 }
@@ -228,6 +233,14 @@ func (s *Store) SetNodeMode(mode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.NodeMode = mode
+	return s.persistLocked()
+}
+
+// SetAllowRemoteUpgrade persists the remote-upgrade opt-in flag.
+func (s *Store) SetAllowRemoteUpgrade(allow bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.AllowRemoteUpgrade = allow
 	return s.persistLocked()
 }
 

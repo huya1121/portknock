@@ -10,7 +10,19 @@
     --fg:#eef1f8; --muted:#9aa4c4; --accent:#6d8cff; --accent2:#8b5cf6;
     --ok:#34d399; --ok-bg:rgba(52,211,153,.12); --ring:rgba(109,140,255,.5);
     --shadow:0 20px 60px -20px rgba(0,0,0,.6);
+    --surface:rgba(255,255,255,.05);
   }
+  :root[data-theme="light"] {
+    --bg0:#eef1f8; --bg1:#dfe4f2; --card:#ffffff; --card-br:rgba(16,24,48,.12);
+    --fg:#1a2036; --muted:#5a6487; --accent:#4f6bff; --accent2:#7c3aed;
+    --ok:#059669; --ok-bg:rgba(5,150,105,.1); --ring:rgba(79,107,255,.35);
+    --shadow:0 18px 50px -24px rgba(16,24,48,.35);
+    --surface:rgba(16,24,48,.04);
+  }
+  /* Light theme: alert text colors (tuned for dark bg) are too pale on white. */
+  :root[data-theme="light"] .ok { color:#065f46; }
+  :root[data-theme="light"] .err { background:rgba(220,38,38,.09); border-color:rgba(220,38,38,.4); color:#991b1b; }
+  :root[data-theme="light"] .port { color:#3730a3; }
   * { box-sizing:border-box; }
   html,body { height:100%; }
   body {
@@ -52,7 +64,7 @@
   }
   .pass {
     width:100%; box-sizing:border-box; padding:.75rem .9rem; font-size:1rem; color:var(--fg);
-    background:rgba(255,255,255,.05); border:1px solid var(--card-br); border-radius:12px;
+    background:var(--surface); border:1px solid var(--card-br); border-radius:12px;
     margin-bottom:.8rem; outline:none;
   }
   .pass:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
@@ -81,7 +93,20 @@
   .foot { text-align:center; color:var(--muted); font-size:.8rem; margin-top:1.1rem; }
   .foot a { color:var(--accent); text-decoration:none; }
   .foot a:hover { text-decoration:underline; }
+  .theme-toggle { background:none; border:0; color:var(--muted); cursor:pointer; font-size:.9rem;
+    padding:0 .3rem; }
 </style>
+<script>
+  // Theme states: "light"/"dark" force it; "auto" (default) follows day/night by
+  // local clock — light between 06:00–18:00, dark otherwise.
+  window.pkIsDaytime = function () { var h = new Date().getHours(); return h >= 6 && h < 18; };
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('pk-theme'); } catch (e) {}
+    var light = saved === 'light' || (saved !== 'dark' && window.pkIsDaytime());
+    if (light) document.documentElement.setAttribute('data-theme', 'light');
+  })();
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -99,6 +124,12 @@
       <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/><path d="M8 12.5l2.5 2.5L16 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <div>已放行成功。你的 IP 现可访问本机全部端口。<br>48 小时内若无连接记录将自动移除。</div>
     </div>
+    {{if .Ports}}
+    <div class="portlabel" style="margin-top:-.6rem">本机当前对外开放的端口（TCP+UDP）：</div>
+    <div class="ports">
+      {{range .Ports}}<span class="port">{{.}}</span>{{end}}
+    </div>
+    {{end}}
     {{end}}
     {{if eq .Error "password"}}
     <div class="err">
@@ -122,7 +153,30 @@
       <button class="btn" type="submit">放行我的 IP</button>
     </form>
   </div>
-  <div class="foot">由 ufw 防火墙保护 · 规则空闲 48 小时自动回收 · <a href="/admin">管理员入口</a> · portknock {{.Version}}</div>
+  <div class="foot">由 ufw 防火墙保护 · 规则空闲 48 小时自动回收 · <a href="/admin">管理员入口</a> · portknock {{.Version}}
+    · <button class="theme-toggle" type="button" id="theme-toggle" aria-label="切换主题">🌙 主题</button></div>
 </div>
+<script>
+  // Toggle cycles: 自动(按昼夜) → 浅色 → 深色 → 自动.
+  (function () {
+    var btn = document.getElementById('theme-toggle');
+    if (!btn) return;
+    function get() { try { return localStorage.getItem('pk-theme') || 'auto'; } catch (e) { return 'auto'; } }
+    function apply(mode) {
+      var light = mode === 'light' || (mode === 'auto' && window.pkIsDaytime());
+      if (light) document.documentElement.setAttribute('data-theme', 'light');
+      else document.documentElement.removeAttribute('data-theme');
+      btn.textContent = mode === 'auto' ? '🌗 自动' : (light ? '☀️ 浅色' : '🌙 深色');
+    }
+    apply(get());
+    btn.addEventListener('click', function () {
+      var next = { auto: 'light', light: 'dark', dark: 'auto' }[get()] || 'auto';
+      try { localStorage.setItem('pk-theme', next); } catch (e) {}
+      apply(next);
+    });
+    // In auto mode, re-evaluate periodically so the theme flips at dawn/dusk.
+    setInterval(function () { if (get() === 'auto') apply('auto'); }, 10 * 60 * 1000);
+  })();
+</script>
 </body>
 </html>

@@ -10,6 +10,12 @@
     --fg:#eef1f8; --muted:#9aa4c4; --accent:#6d8cff; --accent2:#8b5cf6;
     --err:#f87171; --ring:rgba(109,140,255,.5); --shadow:0 20px 60px -20px rgba(0,0,0,.6);
   }
+  :root[data-theme="light"] {
+    --bg0:#eef1f8; --bg1:#dfe4f2; --card:#ffffff; --card-br:rgba(16,24,48,.12);
+    --fg:#1a2036; --muted:#5a6487; --accent:#4f6bff; --accent2:#7c3aed;
+    --err:#dc2626; --ring:rgba(79,107,255,.35); --shadow:0 18px 50px -24px rgba(16,24,48,.35);
+    --surface:rgba(16,24,48,.04);
+  }
   * { box-sizing:border-box; }
   html,body { height:100%; }
   body {
@@ -33,7 +39,7 @@
   label { display:block; color:var(--muted); font-size:.82rem; margin-bottom:.4rem; }
   input {
     width:100%; box-sizing:border-box; padding:.75rem .85rem; font-size:1rem; color:var(--fg);
-    background:rgba(255,255,255,.05); border:1px solid var(--card-br); border-radius:12px;
+    background:var(--surface,rgba(255,255,255,.05)); border:1px solid var(--card-br); border-radius:12px;
     margin-bottom:1.2rem; outline:none; transition:border-color .15s, box-shadow .15s;
   }
   input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
@@ -49,7 +55,18 @@
     margin-bottom:1.1rem; font-size:.9rem;
   }
   .err svg { width:18px; height:18px; color:var(--err); flex:none; }
+  /* Light theme: the pale-red alert text is invisible on white. */
+  :root[data-theme="light"] .err { color:#991b1b; background:rgba(220,38,38,.09); border-color:rgba(220,38,38,.4); }
 </style>
+<script>
+  (function () {
+    try {
+      if (localStorage.getItem('pk-theme') === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    } catch (e) {}
+  })();
+</script>
 </head>
 <body>
 <div class="wrap">

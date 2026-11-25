@@ -276,6 +276,63 @@ func (s *Syncer) syncingEnabled() bool {
 	return s.EffectiveMode() == "center"
 }
 
+// UpgradeChildren (center only) POSTs /api/upgrade to every child in the
+// background, asking each to re-download and restart. Best-effort: records the
+// per-child result in the status map. A child only acts if it has opted in
+// (AllowRemoteUpgrade) — this call just asks.
+func (s *Syncer) UpgradeChildren() {
+	if !s.syncingEnabled() {
+		return
+	}
+	children := s.store.Snapshot().Children
+	if len(children) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, c := range children {
+			c := c
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := s.postSync(ctx, c, "/api/upgrade", nil)
+				s.record(c.URL, err)
+				if err != nil {
+					log.Printf("upgrade: %s: %v", c.URL, err)
+				} else {
+					log.Printf("upgrade: requested -> %s", c.URL)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+}
+
+// postSync sends an authenticated node-to-node POST (Bearer key + sync header)
+// to childBase(c.URL)+path with an optional JSON body. Returns nil on 2xx.
+// Shared by the port-push and upgrade paths.
+func (s *Syncer) postSync(ctx context.Context, c Child, path string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, childBase(c.URL)+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(syncHeader, "1")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("child %s returned HTTP %d", c.URL, resp.StatusCode)
+	}
+	return nil
+}
+
 // FanOut pushes one ip to all configured children in the background.
 func (s *Syncer) FanOut(ip string) {
 	if !s.syncingEnabled() {

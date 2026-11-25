@@ -118,8 +118,12 @@ func main() {
 	mux.HandleFunc("/admin/children", srv.handleChildren)
 	mux.HandleFunc("/admin/sync-interval", srv.handleSyncInterval)
 	mux.HandleFunc("/admin/node-mode", srv.handleNodeMode)
+	mux.HandleFunc("/admin/upgrade", srv.handleUpgradeSelf)
+	mux.HandleFunc("/admin/upgrade-children", srv.handleUpgradeChildren)
+	mux.HandleFunc("/admin/allow-remote-upgrade", srv.handleAllowRemoteUpgrade)
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 	mux.HandleFunc("/api/ports", srv.handleAPIPorts)
+	mux.HandleFunc("/api/upgrade", srv.handleAPIUpgrade)
 
 	// HTTPS only, with an auto-generated self-signed cert kept next to the state
 	// file. Browsers warn on the self-signed cert, but all traffic (admin
@@ -218,7 +222,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	st := s.store.Snapshot()
 	data := indexData{
 		ClientIP: s.clientIP(r),
-		Ports:    st.Ports,
+		Ports:    allOpenPorts(st), // all open ports (local + synced + received)
 		Granted:  r.URL.Query().Get("granted") == "1",
 		Error:    r.URL.Query().Get("err"),
 		CSRF:     s.grantToken(w, r),
@@ -433,6 +437,7 @@ type adminData struct {
 	IsCenter    bool           // effective role is center -> show center controls
 	NodeMode    string         // raw override: "center" | "child" | "" (auto)
 	HasUpstream bool           // some upstream has pushed to us (for auto-mode hint)
+	AllowRemoteUpgrade bool    // this node accepts remote upgrade pushes
 	SyncInterval    string     // human-readable keep-alive interval, e.g. "2分钟"
 	SyncIntervalSec int        // the same as seconds, for the form input value
 	APIKey      string         // JSON API bearer token ("" = API disabled)
@@ -607,6 +612,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		IsCenter:    isCenter,
 		NodeMode:    st.NodeMode,
 		HasUpstream: len(upstreams) > 0,
+		AllowRemoteUpgrade: st.AllowRemoteUpgrade,
 		SyncInterval:    humanizeDuration(syncIv),
 		SyncIntervalSec: int(syncIv.Seconds()),
 		APIKey:      s.cfg.APIKey,
@@ -830,6 +836,83 @@ func (s *Server) handleNodeMode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleUpgradeSelf triggers a local upgrade (re-download latest + restart) by
+// running the installed management script in the background.
+func (s *Server) handleUpgradeSelf(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if err := runSelfUpgrade(); err != nil {
+		log.Printf("self upgrade: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("self upgrade triggered by admin %s", s.clientIP(r))
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleUpgradeChildren (center only) remotely triggers every child node to
+// upgrade itself, via each child's /api/upgrade endpoint.
+func (s *Server) handleUpgradeChildren(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.syncer != nil {
+		s.syncer.UpgradeChildren()
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleAllowRemoteUpgrade toggles whether this node accepts remote upgrade
+// pushes from an upstream center (the /api/upgrade gate). Default off.
+func (s *Server) handleAllowRemoteUpgrade(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	allow := r.FormValue("allow") == "1"
+	if err := s.store.SetAllowRemoteUpgrade(allow); err != nil {
+		log.Printf("set allow-remote-upgrade: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// handleAPIUpgrade is the internal node-to-node endpoint a center calls to make
+// this (child) node upgrade itself. THREE gates, all required:
+//  1. valid API key (checkAPIKey)
+//  2. the node-to-node sync header (never reachable as a plain public call)
+//  3. the admin has opted in via AllowRemoteUpgrade (default false)
+func (s *Server) handleAPIUpgrade(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.APIKey == "" {
+		http.Error(w, "api disabled", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.checkAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if r.Header.Get(syncHeader) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
+		return
+	}
+	if !s.store.Snapshot().AllowRemoteUpgrade {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "remote upgrade disabled on this node"})
+		return
+	}
+	if err := runSelfUpgrade(); err != nil {
+		log.Printf("api upgrade: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	log.Printf("remote upgrade triggered by upstream %s", s.clientIP(r))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "upgrading"})
 }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
