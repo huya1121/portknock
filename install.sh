@@ -70,6 +70,32 @@ need_root() { [ "$(id -u)" -eq 0 ] || die "请用 root 运行（sudo）。"; }
 
 gen_secret() { head -c "${1:-18}" /dev/urandom | base64 | tr -d '/+=' | cut -c1-"${2:-24}"; }
 
+# ensure_ufw makes sure the ufw command is available, installing it via the
+# system package manager when missing. Dies if it can't be installed, since the
+# whole service is useless without ufw.
+ensure_ufw() {
+  command -v ufw >/dev/null 2>&1 && return
+  say "未检测到 ufw，尝试自动安装 ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ufw
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ufw
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install ufw
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm ufw
+  elif command -v apk >/dev/null 2>&1; then
+    apk add ufw
+  else
+    die "无法自动安装 ufw：未识别的包管理器，请手动安装后重试。"
+  fi
+  command -v ufw >/dev/null 2>&1 || die "ufw 安装后仍未找到，请手动检查。"
+  say "ufw 已安装。"
+}
+
 # check_port warns if the configured LISTEN port is already in use by a process
 # other than portknock itself (so re-installs/upgrades don't false-alarm).
 check_port() {
@@ -97,7 +123,7 @@ check_port() {
 cmd_install() {
   need_root
   command -v systemctl >/dev/null 2>&1 || die "需要 systemd（systemctl 未找到）。"
-  command -v ufw >/dev/null 2>&1 || warn "未检测到 ufw，请先安装并启用：apt install ufw && ufw enable"
+  ensure_ufw
 
   if command -v ufw >/dev/null 2>&1; then
     ver="$(ufw --version 2>/dev/null | awk '/ufw/{print $2; exit}')"
@@ -173,8 +199,12 @@ EOF
 
   echo
   say "✅ 部署完成。监听地址：${LISTEN}"
-  if [ "$newcreds" = "1" ]; then
-    print_creds
+  # Always show credentials — on a fresh install they're newly generated, on an
+  # upgrade/reinstall they're the existing ones, but either way the user wants
+  # to see them here.
+  print_creds
+  if [ "$newcreds" != "1" ]; then
+    echo "  （以上为已有密码，本次升级未改动；如需更换用 ${SUDO}portknock-ctl reset-password）"
   fi
   echo "  用户页：  http://${LISTEN}/"
   echo "  管理台：  http://${LISTEN}/admin"
@@ -190,7 +220,16 @@ EOF
     echo "  Cookie：  Secure 关闭（HTTP 可正常登录）。上了 HTTPS 再用 PORTKNOCK_SECURE_COOKIE=1 开启"
   fi
   echo
-  echo "以后可用： ${SUDO}portknock-ctl status | creds | update | uninstall | logs"
+  echo "管理命令（直接运行 ${SUDO}portknock-ctl 不带参数可进交互菜单）："
+  echo "  ${SUDO}portknock-ctl status          服务状态 + 白名单概览"
+  echo "  ${SUDO}portknock-ctl urls            访问链接 + API 调用示例"
+  echo "  ${SUDO}portknock-ctl creds           查看管理密码 / API 密钥"
+  echo "  ${SUDO}portknock-ctl reset-password  重新生成密码并重启"
+  echo "  ${SUDO}portknock-ctl update          升级到最新版本"
+  echo "  ${SUDO}portknock-ctl logs            实时日志"
+  echo "  ${SUDO}portknock-ctl restart         重启服务"
+  echo "  ${SUDO}portknock-ctl backup [文件]   备份状态"
+  echo "  ${SUDO}portknock-ctl uninstall       卸载（--purge 连状态密钥一起删）"
 }
 
 # Default publicly-open ports seeded into a fresh state.json (and allowed via
@@ -600,14 +639,20 @@ menu() {
 }
 
 main() {
-  # With an explicit subcommand (or piped via curl|bash), run it directly so the
-  # one-line install command is unaffected. Only drop into the interactive menu
-  # when run with no arguments on a real terminal.
+  # An explicit subcommand always runs directly, so automation like
+  # `... | bash -s -- install` and `portknock-ctl status` stays non-interactive.
   if [ "$#" -gt 0 ]; then
     run_cmd "$@"
     return
   fi
-  if [ -t 0 ] && [ -t 1 ]; then
+  # No arguments: show the interactive menu, even for the piped one-liner
+  # (curl | bash). When piped, stdin is the script itself, so reattach it to the
+  # controlling terminal. If there's no terminal at all (truly unattended, e.g.
+  # CI), fall back to a direct install so it never hangs waiting for input.
+  if [ -t 0 ]; then
+    menu
+  elif { : </dev/tty; } 2>/dev/null; then
+    exec </dev/tty
     menu
   else
     run_cmd install

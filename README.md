@@ -22,20 +22,27 @@
 
 ## 一键部署
 
-目标机器需要 root 和 ufw（Debian 12/13、Ubuntu 24.04+ 之类都行）：
+目标机器需要 root（Debian 12/13、Ubuntu 24.04+ 之类都行；ufw 没装脚本会自动装）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh | sudo bash
 ```
 
-脚本做这些事：按 CPU 架构下载最新 Release 二进制并校验 → 装到 `/usr/local/bin/portknock`
+脚本做这些事：检测 ufw，没装就用系统包管理器自动装（apt/dnf/yum/zypper/pacman/apk）→
+按 CPU 架构下载最新 Release 二进制并校验 → 装到 `/usr/local/bin/portknock`
 （同时装一个管理命令 `portknock-ctl`）→ 预置默认开放端口 `80, 443, 22, 222` →
 自动放行 SSH 端口防止把自己锁在外面 → 生成随机的**管理密码**和 **API 密钥**
-（写进 `/etc/portknock.env`，权限 600）→ 注册并启动 systemd 服务。装完会在终端打印密码和访问地址。
+（写进 `/etc/portknock.env`，权限 600）→ 注册并启动 systemd 服务。
+不管首装还是重装，结尾都会完整打印访问地址、管理密码、API 密钥和所有管理命令。
 重复执行就是原地升级，状态和密码都保留。
 
-本地直接跑 `sudo portknock-ctl`（不带参数）会进一个交互菜单，首次安装也可以走里面的引导向导，
-一步步问你监听地址、端口、SSH 口、是否反代。
+在终端直接跑这条一键命令会进一个交互菜单，可以选引导安装（一步步问你监听地址、端口、
+SSH 口、是否反代），也能查状态、看密码、重启等。装好后用 `portknock-ctl`（不带参数）
+随时再进这个菜单。要无人值守、不弹菜单直接装，用：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh | sudo bash -s -- install
+```
 
 ### 默认开放端口
 
@@ -63,11 +70,12 @@ curl -fsSL https://raw.githubusercontent.com/huya1121/portknock/main/install.sh 
   | sudo PORTKNOCK_LISTEN=0.0.0.0:8888 bash
 ```
 
-安装时如果发现端口被别的进程占了会提示你换一个。
+对外监听（`0.0.0.0`）时，安装脚本会自动放行这个监听端口（带 `portknock-install:` 注释，
+管理台删不掉、升级也保留），不用再手动开，否则 ufw 一启用会把管理口自己挡掉。安装时如果
+发现端口被别的进程占了也会提示你换一个。
 
-对外监听（`0.0.0.0`）之前想清楚几点：这个端口得自己放行（管理台加进开放端口，或先
-`sudo ufw allow 8080/tcp`），否则 ufw 一开就把管理口也挡了；而且是明文 HTTP，
-密码和 API 密钥都走明文；用户页对公网开放意味着任何人都能打开它放行自己，面向公众时最好加口令或只给可信网络。
+但要注意：对外是明文 HTTP，密码和 API 密钥都走明文传输；用户页对公网开放意味着任何人都能
+打开它放行自己。面向公众时最好加口令、套 HTTPS 反代，或只放给可信网络。
 
 只想自己偶尔管一下、不想暴露端口的话，**SSH 隧道最省心**（保持默认 `127.0.0.1:8080` 不动）：
 
