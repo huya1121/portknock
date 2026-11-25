@@ -628,7 +628,9 @@ func (s *Server) handleChildren(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := r.FormValue("action")
-	url := strings.TrimRight(strings.TrimSpace(r.FormValue("url")), "/")
+	// Normalize: strip trailing slashes and an accidentally-pasted "/api/grant"
+	// so we store a clean origin and never build "…/api/grant/api/grant".
+	url := childBase(r.FormValue("url"))
 	var err error
 	switch action {
 	case "add":

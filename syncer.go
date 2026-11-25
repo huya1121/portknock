@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,10 +38,29 @@ type Syncer struct {
 
 func NewSyncer(store *Store) *Syncer {
 	return &Syncer{
-		store:  store,
-		client: &http.Client{Timeout: 10 * time.Second},
+		store: store,
+		// Node-to-node sync skips TLS cert verification on purpose: every node
+		// serves a self-signed cert whose SANs cover only its local interface
+		// IPs (not NAT/public IPs or hostnames), so chain verification can never
+		// succeed between nodes. Authentication is provided by the per-child API
+		// key (Bearer token), not by the certificate — same tradeoff as curl -k.
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // see comment above
+			},
+		},
 		status: map[string]ChildStatus{},
 	}
+}
+
+// childBase normalizes a child URL the admin entered: strips trailing slashes
+// and a trailing "/api/grant" (a common copy-paste from the API card), so we
+// never build "…/api/grant/api/grant". Returns the base origin (scheme+host).
+func childBase(raw string) string {
+	u := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u = strings.TrimSuffix(u, "/api/grant")
+	return strings.TrimRight(u, "/")
 }
 
 // Status returns a copy of the last-push result for each child URL.
@@ -67,7 +88,7 @@ func (s *Syncer) record(url string, err error) {
 // pushOne grants ip on a single child node. Returns nil on a 2xx "granted".
 func (s *Syncer) pushOne(ctx context.Context, c Child, ip string) error {
 	body, _ := json.Marshal(map[string]string{"ip": ip})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL+"/api/grant", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, childBase(c.URL)+"/api/grant", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
