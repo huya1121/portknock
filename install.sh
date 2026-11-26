@@ -130,6 +130,21 @@ cmd_install() {
   GRANT_PASS="${PORTKNOCK_GRANT_PASSWORD:-$GRANT_PASS}"
   SSH_PORT="${PORTKNOCK_SSH_PORT:-$SSH_PORT}"
   LISTEN="${PORTKNOCK_LISTEN:-$LISTEN}"
+
+  # UPGRADE: inherit settings from the already-installed service unless the user
+  # explicitly overrode them via env vars. Otherwise an upgrade would rewrite the
+  # unit with script defaults and silently change the listen address / proxy mode.
+  if [ -f "$SERVICE" ]; then
+    if [ -z "${PORTKNOCK_LISTEN:-}" ]; then
+      local cur_listen; cur_listen="$(effective_listen)"
+      [ -n "$cur_listen" ] && LISTEN="$cur_listen"
+    fi
+    if [ -z "${PORTKNOCK_TRUST_PROXY:-}" ]; then
+      grep -q -- '--trust-proxy' "$SERVICE" 2>/dev/null && TRUST_PROXY=1
+    fi
+    say "检测到已安装服务，升级将沿用现有配置（监听 ${LISTEN}）。设 PORTKNOCK_LISTEN=... 可改。"
+  fi
+
   ensure_ufw
 
   if command -v ufw >/dev/null 2>&1; then
@@ -231,7 +246,12 @@ EOF
   write_service
   say "注册并启动服务 ..."
   systemctl daemon-reload
-  systemctl enable --now portknock
+  systemctl enable portknock >/dev/null 2>&1 || true
+  # Use restart (not `enable --now`): on an UPGRADE the service is already
+  # running, and `enable --now` is a no-op for a running unit — it would NOT
+  # reload the freshly-downloaded binary, so the old version keeps running
+  # ("升级成功但版本没变"). restart always re-execs the new binary.
+  systemctl restart portknock
   sleep 1
   systemctl is-active --quiet portknock || { journalctl -u portknock -n 20 --no-pager || true; die "服务未能启动，见上方日志。"; }
 
