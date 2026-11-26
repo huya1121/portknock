@@ -89,6 +89,9 @@ func (j *Janitor) tick() {
 	for _, f := range st.FixedIPs {
 		fixed[f] = true
 	}
+	for _, f := range st.ReceivedFixedIPs { // received fixed IPs are permanent too
+		fixed[f] = true
+	}
 	for _, ip := range expired {
 		log.Printf("janitor: expiring idle dynamic IP %s", ip)
 		if fixed[ip] {
@@ -170,3 +173,4 @@ func firstValue(line, key string) string {
 	}
 	return rest
 }
+

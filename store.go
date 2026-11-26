@@ -38,6 +38,10 @@ type State struct {
 	// when reconciling the firewall.
 	SyncPorts     []int `json:"sync_ports"`
 	ReceivedPorts []int `json:"received_ports"`
+	// ReceivedFixedIPs are permanent-whitelist IPs this node (as a child) received
+	// from an upstream center. They behave like local FixedIPs (all-port, never
+	// expire) but are read-only here — the center owns the list (full-list sync).
+	ReceivedFixedIPs []string `json:"received_fixed_ips"`
 	// SyncInterval is the keep-alive re-push interval to children, as a Go
 	// duration string (e.g. "2m", "30s"). Empty = default. Configurable from the
 	// admin UI; the syncer's keep-alive loop reads it each pass.
@@ -92,6 +96,9 @@ func NewStore(path string) (*Store, error) {
 	if s.state.ReceivedPorts == nil {
 		s.state.ReceivedPorts = []int{}
 	}
+	if s.state.ReceivedFixedIPs == nil {
+		s.state.ReceivedFixedIPs = []string{}
+	}
 	return s, nil
 }
 
@@ -110,6 +117,7 @@ func (s *Store) copyLocked() State {
 		Children:      append([]Child(nil), s.state.Children...),
 		SyncPorts:     append([]int(nil), s.state.SyncPorts...),
 		ReceivedPorts: append([]int(nil), s.state.ReceivedPorts...),
+		ReceivedFixedIPs: append([]string(nil), s.state.ReceivedFixedIPs...),
 		SyncInterval:  s.state.SyncInterval,
 		NodeMode:      s.state.NodeMode,
 		AllowRemoteUpgrade: s.state.AllowRemoteUpgrade,
@@ -189,6 +197,27 @@ func (s *Store) SetReceivedPorts(ports []int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.ReceivedPorts = clean
+	return s.persistLocked()
+}
+
+// SetReceivedFixedIPs replaces the fixed IPs received from an upstream center
+// (child side). Full-list replace — the center's declarative push wins. Invalid
+// IPs are dropped, result is deduped + sorted.
+func (s *Store) SetReceivedFixedIPs(ips []string) error {
+	seen := map[string]bool{}
+	clean := []string{}
+	for _, ip := range ips {
+		c := canonicalIP(ip)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		clean = append(clean, c)
+	}
+	sort.Strings(clean)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.ReceivedFixedIPs = clean
 	return s.persistLocked()
 }
 
@@ -361,3 +390,4 @@ func (s *Store) TouchAndExpire(active map[string]bool, window time.Duration, now
 	}
 	return expired, nil
 }
+

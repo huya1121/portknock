@@ -209,8 +209,9 @@ curl -k -X POST https://host/api/grant \
 保证子节点上的规则不会因 48 小时空闲被回收。
 
 **两种 IP 都同步**：用户自助放行的动态 IP、以及 admin 手动加的固定 IP，**都会**推送到子节点。
-固定 IP 推到子节点后在子节点上表现为**动态 IP**，靠中心的 janitor 保活不过期（子节点的 API 只能动态放行）。
-固定 IP 的**移除不会**同步——删掉后子节点那份会自己空闲回收掉。
+- 动态 IP：在子节点上也是动态 IP，靠中心 janitor 保活不过期。
+- 固定 IP：全量下发到子节点，在子节点上也是**真正的固定白名单**（全端口、永不过期、只读显示在集群页的
+  「来自上游的固定白名单」区）。全量声明式：中心**新增和删除都会同步**——删掉一个固定 IP，子节点上也随之移除。
 
 **开放端口可选同步**：对外开放端口分两类——
 - 「**对外开放端口（仅本机）**」：只在本机生效，不下发，保持原行为。
@@ -437,3 +438,4 @@ across hosts; the API key provides authentication and the link stays encrypted.
 
 Build from source: `go build -o portknock .` (cross-compile with
 `GOOS=linux GOARCH=amd64`). Run `go test ./...` for the unit tests.
+

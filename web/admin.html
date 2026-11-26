@@ -427,6 +427,12 @@
       <div class="chips">{{range .ReceivedPorts}}<span class="chip">{{.}} tcp+udp</span>{{end}}</div>
     </div>
     {{end}}
+    {{if .ReceivedFixedIPs}}
+    <div class="upstream">
+      <div class="k" style="margin-bottom:.4rem;">⬇ 来自上游的固定白名单 IP（由主节点下发，全端口·永不过期·本机只读）</div>
+      {{range .ReceivedFixedIPs}}<div class="uprow"><span class="mono">{{.}}</span></div>{{end}}
+    </div>
+    {{end}}
   </div>
 
   <div class="card" data-tab="cluster">

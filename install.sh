@@ -178,9 +178,22 @@ cmd_install() {
   say "已安装二进制：${BIN_PATH}"
   mkdir -p "$STATE_DIR"
 
-  # Install this script as portknock-ctl for later management.
+  # Install/refresh this script as portknock-ctl for later management.
+  # NOTE: never write directly to a path we might be executing right now
+  # (self-overwrite corrupts the running bash). Write to a temp, then atomically
+  # rename — rename keeps the running process's open inode intact.
   if [ -f "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "$CTL_PATH" ]; then
+    # Launched from a local file that isn't the installed ctl: copy it in.
     install -m 0755 "${BASH_SOURCE[0]}" "$CTL_PATH" 2>/dev/null && say "管理命令已安装：${CTL_PATH}"
+  elif [ "${BASH_SOURCE[0]:-}" = "$CTL_PATH" ]; then
+    # Running AS the installed ctl (e.g. `portknock-ctl update`): refresh it from
+    # GitHub via temp+rename so we don't truncate the script we're executing.
+    local ctltmp; ctltmp="$(mktemp)"
+    if curl -fsSL -o "$ctltmp" "https://raw.githubusercontent.com/${REPO}/main/install.sh" 2>/dev/null && [ -s "$ctltmp" ]; then
+      chmod 0755 "$ctltmp"; mv -f "$ctltmp" "$CTL_PATH" && say "管理命令已更新：${CTL_PATH}"
+    else
+      rm -f "$ctltmp"  # keep the existing ctl if the refresh download failed
+    fi
   else
     # Running via a pipe (curl | bash): fetch a copy for local use.
     if curl -fsSL -o "$CTL_PATH" "https://raw.githubusercontent.com/${REPO}/main/install.sh" 2>/dev/null; then
@@ -723,3 +736,4 @@ main() {
 }
 
 main "$@"
+

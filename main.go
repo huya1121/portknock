@@ -61,7 +61,13 @@ func main() {
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "log ufw commands instead of executing them")
 	flag.StringVar(&cfg.APIKey, "api-key", "", "bearer token for the JSON API (or env PORTKNOCK_API_KEY); empty disables the API")
 	flag.StringVar(&cfg.GrantPass, "grant-pass", "", "password the user page requires before granting (or env PORTKNOCK_GRANT_PASSWORD); empty = no password")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	if cfg.AdminPass == "" {
 		cfg.AdminPass = os.Getenv("PORTKNOCK_ADMIN_PASS")
@@ -125,6 +131,7 @@ func main() {
 	mux.HandleFunc("/api/ports", srv.handleAPIPorts)
 	mux.HandleFunc("/api/upgrade", srv.handleAPIUpgrade)
 	mux.HandleFunc("/api/info", srv.handleAPIInfo)
+	mux.HandleFunc("/api/fixed", srv.handleAPIFixed)
 
 	// HTTPS only, with an auto-generated self-signed cert kept next to the state
 	// file. Browsers warn on the self-signed cert, but all traffic (admin
@@ -397,6 +404,47 @@ func (s *Server) handleAPIPorts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ports": s.store.Snapshot().ReceivedPorts, "status": "ok"})
 }
 
+// handleAPIFixed is the internal node-to-node endpoint a center pushes its full
+// fixed-IP list to. This (child) node stores them as its received fixed IPs
+// (all-port, never-expire) and reconciles. Gated like the other /api/* sync
+// endpoints (API key + sync header).
+func (s *Server) handleAPIFixed(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.APIKey == "" {
+		http.Error(w, "api disabled", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.checkAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if r.Header.Get(syncHeader) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
+		return
+	}
+	var body struct {
+		IPs []string `json:"ips"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	}
+	if s.syncer != nil {
+		s.syncer.RecordUpstream(s.clientIP(r))
+	}
+	if err := s.store.SetReceivedFixedIPs(body.IPs); err != nil {
+		log.Printf("api fixed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
+		log.Printf("reconcile after received-fixed change: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ips": s.store.Snapshot().ReceivedFixedIPs, "status": "ok"})
+}
+
 // checkAPIKey validates the bearer token in constant time.
 func (s *Server) checkAPIKey(r *http.Request) bool {
 	h := r.Header.Get("Authorization")
@@ -422,6 +470,7 @@ type adminData struct {
 	SyncPorts    []int  // ports distributed to children (center side)
 	SyncPortsStr string // comma-joined, for the form input
 	ReceivedPorts []int // ports received from an upstream center (child side)
+	ReceivedFixedIPs []string // fixed IPs received from an upstream center (child side)
 	FixedIPs   []fixedView
 	Dynamic    []dynView
 	DryRun     bool
@@ -611,6 +660,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		SyncPorts:     st.SyncPorts,
 		SyncPortsStr:  strings.Join(syncPortStrs, ", "),
 		ReceivedPorts: st.ReceivedPorts,
+		ReceivedFixedIPs: st.ReceivedFixedIPs,
 		FixedIPs:   fixed,
 		Dynamic:    dyn,
 		DryRun:     s.cfg.DryRun,
@@ -759,11 +809,10 @@ func (s *Server) handleFixed(w http.ResponseWriter, r *http.Request) {
 	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
 		log.Printf("reconcile after fixed change: %v", err)
 	}
-	// Adding a fixed IP also fans it out to child nodes (they grant it as a
-	// dynamic IP, kept alive by the janitor). Removal is not propagated — child
-	// grants simply idle out on their own.
-	if action == "add" && s.syncer != nil {
-		s.syncer.FanOut(ip)
+	// Push the full fixed-IP list to children so they keep a (read-only) fixed
+	// whitelist matching this center. Full-list = add AND remove both propagate.
+	if s.syncer != nil {
+		s.syncer.FanOutFixed()
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
@@ -996,6 +1045,7 @@ func prospectiveState(cur State, action, value string) (State, error) {
 		Dynamic:       append([]Dynamic(nil), cur.Dynamic...),
 		SyncPorts:     append([]int(nil), cur.SyncPorts...),
 		ReceivedPorts: append([]int(nil), cur.ReceivedPorts...),
+		ReceivedFixedIPs: append([]string(nil), cur.ReceivedFixedIPs...),
 	}
 	switch action {
 	case "ports":

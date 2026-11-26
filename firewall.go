@@ -392,6 +392,13 @@ func desiredRuleLabels(st State) map[string]string {
 		}
 		m[ipRuleKey(ip)] = fmt.Sprintf("IP %s（固定·全端口）", ip)
 	}
+	// Fixed IPs received from an upstream center behave exactly like local fixed.
+	for _, ip := range st.ReceivedFixedIPs {
+		if net.ParseIP(ip) == nil {
+			continue
+		}
+		m[ipRuleKey(ip)] = fmt.Sprintf("IP %s（固定·全端口·来自上游）", ip)
+	}
 	return m
 }
 
@@ -521,3 +528,4 @@ func parseManagedRules(status string) []managedRule {
 	}
 	return rules
 }
+

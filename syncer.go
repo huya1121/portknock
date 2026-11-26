@@ -243,6 +243,40 @@ func (s *Syncer) FanOutPorts() {
 	}()
 }
 
+// FanOutFixed pushes the full fixed-IP list to every child's /api/fixed, so the
+// center's permanent whitelist appears as a (read-only) fixed whitelist on each
+// child. Declarative/full-list: a child replaces its received fixed set with
+// exactly this, so removing a fixed IP at the center removes it on children too.
+func (s *Syncer) FanOutFixed() {
+	if !s.syncingEnabled() {
+		return
+	}
+	st := s.store.Snapshot()
+	if len(st.Children) == 0 {
+		return
+	}
+	ips := append([]string(nil), st.FixedIPs...)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, c := range st.Children {
+			c := c
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				body, _ := json.Marshal(map[string][]string{"ips": ips})
+				if err := s.postSync(ctx, c, "/api/fixed", body); err != nil {
+					log.Printf("sync: push fixed -> %s: %v", c.URL, err)
+				} else {
+					log.Printf("sync: pushed %d fixed IP(s) -> %s", len(ips), c.URL)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+}
+
 // RunKeepAlive periodically re-pushes the full whitelist (IPs + ports) to all
 // children so they don't expire grants on their own idle timer. The interval is
 // read from the store each pass, so changing it in the admin UI takes effect on
@@ -436,17 +470,20 @@ func (s *Syncer) FanOutAll() {
 	if len(st.Children) == 0 {
 		return
 	}
-	ips := make([]string, 0, len(st.Dynamic)+len(st.FixedIPs))
+	// Dynamic IPs are pushed as dynamic (kept alive here). Fixed IPs are pushed
+	// separately via FanOutFixed as a real fixed whitelist on children — not as
+	// dynamic — so they show in the child's fixed section and never expire there.
+	ips := make([]string, 0, len(st.Dynamic))
 	for _, d := range st.Dynamic {
 		ips = append(ips, d.IP)
 	}
-	ips = append(ips, st.FixedIPs...)
 	if len(ips) > 0 {
 		go s.pushToChildren(st.Children, ips)
 	}
-	// Also re-push the sync-port list each pass so children stay converged and
-	// a removed port is re-asserted as closed (full-list/declarative).
+	// Re-push the full sync-port + fixed-IP lists each pass so children stay
+	// converged and removals propagate (full-list/declarative).
 	s.FanOutPorts()
+	s.FanOutFixed()
 	// And refresh each child's reported version for the admin UI.
 	s.FetchVersions()
 }
