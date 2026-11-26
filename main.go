@@ -124,6 +124,7 @@ func main() {
 	mux.HandleFunc("/api/grant", srv.handleAPIGrant)
 	mux.HandleFunc("/api/ports", srv.handleAPIPorts)
 	mux.HandleFunc("/api/upgrade", srv.handleAPIUpgrade)
+	mux.HandleFunc("/api/info", srv.handleAPIInfo)
 
 	// HTTPS only, with an auto-generated self-signed cert kept next to the state
 	// file. Browsers warn on the self-signed cert, but all traffic (admin
@@ -438,6 +439,7 @@ type adminData struct {
 	NodeMode    string         // raw override: "center" | "child" | "" (auto)
 	HasUpstream bool           // some upstream has pushed to us (for auto-mode hint)
 	AllowRemoteUpgrade bool    // this node accepts remote upgrade pushes
+	UpgradeMsg  string         // transient banner after an upgrade action ("" = none)
 	SyncInterval    string     // human-readable keep-alive interval, e.g. "2分钟"
 	SyncIntervalSec int        // the same as seconds, for the form input value
 	APIKey      string         // JSON API bearer token ("" = API disabled)
@@ -447,9 +449,10 @@ type adminData struct {
 
 // childView is a child node plus its last-sync status, for the admin table.
 type childView struct {
-	URL    string
-	Status string // "ok" | "fail" | "unknown"
-	Detail string // human-readable last-sync info
+	URL     string
+	Status  string // "ok" | "fail" | "unknown"
+	Detail  string // human-readable last-sync info
+	Version string // child's reported version ("" = unknown)
 }
 
 // upstreamView is an upstream center (a node that has pushed sync grants to us).
@@ -555,13 +558,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	for _, c := range st.Children {
 		cv := childView{URL: c.URL, Status: "unknown", Detail: "尚未推送"}
 		if st, ok := syncStatus[c.URL]; ok {
-			when := st.When.Local().Format("01-02 15:04")
-			if st.OK {
-				cv.Status = "ok"
-				cv.Detail = "最近同步 " + when + " 成功"
-			} else {
-				cv.Status = "fail"
-				cv.Detail = "最近同步 " + when + " 失败：" + st.Err
+			cv.Version = st.Version
+			if !st.When.IsZero() {
+				when := st.When.Local().Format("01-02 15:04")
+				if st.OK {
+					cv.Status = "ok"
+					cv.Detail = "最近同步 " + when + " 成功"
+				} else {
+					cv.Status = "fail"
+					cv.Detail = "最近同步 " + when + " 失败：" + st.Err
+				}
 			}
 		}
 		children = append(children, cv)
@@ -588,6 +594,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	syncIv := s.store.SyncIntervalOr(s.cfg.Poll)
 	isCenter := s.syncer.EffectiveMode() == "center"
+	var upgradeMsg string
+	switch r.URL.Query().Get("upgrade") {
+	case "started":
+		upgradeMsg = "✅ 升级已在后台开始：正在下载最新版本并重启服务，稍候片刻刷新页面。"
+	case "failed":
+		upgradeMsg = "⚠️ 升级未能启动（可能本机未安装 portknock-ctl / 非一键安装部署）。详见服务日志。"
+	case "children":
+		upgradeMsg = "✅ 已向所有子节点发送升级请求（仅对已开启“允许远程升级”的子节点生效）。"
+	}
 
 	s.render(w, "admin.html", adminData{
 		CSRF:          s.auth.CSRF(r),
@@ -613,6 +628,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		NodeMode:    st.NodeMode,
 		HasUpstream: len(upstreams) > 0,
 		AllowRemoteUpgrade: st.AllowRemoteUpgrade,
+		UpgradeMsg:  upgradeMsg,
 		SyncInterval:    humanizeDuration(syncIv),
 		SyncIntervalSec: int(syncIv.Seconds()),
 		APIKey:      s.cfg.APIKey,
@@ -846,11 +862,11 @@ func (s *Server) handleUpgradeSelf(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := runSelfUpgrade(); err != nil {
 		log.Printf("self upgrade: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Redirect(w, r, "/admin?upgrade=failed#cluster", http.StatusSeeOther)
 		return
 	}
 	log.Printf("self upgrade triggered by admin %s", s.clientIP(r))
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?upgrade=started#cluster", http.StatusSeeOther)
 }
 
 // handleUpgradeChildren (center only) remotely triggers every child node to
@@ -860,9 +876,10 @@ func (s *Server) handleUpgradeChildren(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.syncer != nil {
-		s.syncer.UpgradeChildren()
+		// Empty list = all children; otherwise only the checked ones.
+		s.syncer.UpgradeChildren(r.Form["child"])
 	}
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?upgrade=children#cluster", http.StatusSeeOther)
 }
 
 // handleAllowRemoteUpgrade toggles whether this node accepts remote upgrade
@@ -913,6 +930,25 @@ func (s *Server) handleAPIUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("remote upgrade triggered by upstream %s", s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "upgrading"})
+}
+
+// handleAPIInfo is a read-only internal endpoint returning this node's version,
+// so an upstream center can display it. Gated like the other /api/* endpoints
+// (API key + sync header); not exposed to the public.
+func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.APIKey == "" {
+		http.Error(w, "api disabled", http.StatusNotFound)
+		return
+	}
+	if !s.checkAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if r.Header.Get(syncHeader) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"version": version})
 }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
@@ -1106,3 +1142,4 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 		log.Printf("render %s: %v", name, err)
 	}
 }
+

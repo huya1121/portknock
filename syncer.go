@@ -20,9 +20,10 @@ const syncHeader = "X-Portknock-Sync"
 
 // ChildStatus is the outcome of the last push to a child node, shown in admin.
 type ChildStatus struct {
-	OK   bool      // last push succeeded
-	When time.Time // when that last push happened (zero = never tried)
-	Err  string    // short error if the last push failed
+	OK      bool      // last push succeeded
+	When    time.Time // when that last push happened (zero = never tried)
+	Err     string    // short error if the last push failed
+	Version string    // child's reported version (from /api/info), "" = unknown
 }
 
 // Syncer fans dynamic grants out to downstream ("child") portknock nodes by
@@ -103,14 +104,30 @@ func (s *Syncer) Upstreams() map[string]time.Time {
 	return out
 }
 
-// record stores the outcome of a push to url.
+// record stores the outcome of a push to url, preserving any known Version.
 func (s *Syncer) record(url string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := ChildStatus{OK: err == nil, When: time.Now()}
+	st := s.status[url] // keep existing Version
+	st.OK = err == nil
+	st.When = time.Now()
 	if err != nil {
 		st.Err = err.Error()
+	} else {
+		st.Err = ""
 	}
+	s.status[url] = st
+}
+
+// recordVersion stores a child's reported version without touching push status.
+func (s *Syncer) recordVersion(url, ver string) {
+	if ver == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.status[url]
+	st.Version = ver
 	s.status[url] = st
 }
 
@@ -276,15 +293,24 @@ func (s *Syncer) syncingEnabled() bool {
 	return s.EffectiveMode() == "center"
 }
 
-// UpgradeChildren (center only) POSTs /api/upgrade to every child in the
-// background, asking each to re-download and restart. Best-effort: records the
-// per-child result in the status map. A child only acts if it has opted in
-// (AllowRemoteUpgrade) — this call just asks.
-func (s *Syncer) UpgradeChildren() {
+// UpgradeChildren (center only) POSTs /api/upgrade to children in the background.
+// If urls is empty, all children are targeted; otherwise only children whose URL
+// is in urls. Best-effort: records the per-child result. A child only acts if it
+// has opted in (AllowRemoteUpgrade) — this call just asks.
+func (s *Syncer) UpgradeChildren(urls []string) {
 	if !s.syncingEnabled() {
 		return
 	}
-	children := s.store.Snapshot().Children
+	sel := map[string]bool{}
+	for _, u := range urls {
+		sel[childBase(u)] = true
+	}
+	var children []Child
+	for _, c := range s.store.Snapshot().Children {
+		if len(sel) == 0 || sel[childBase(c.URL)] {
+			children = append(children, c)
+		}
+	}
 	if len(children) == 0 {
 		return
 	}
@@ -303,6 +329,60 @@ func (s *Syncer) UpgradeChildren() {
 					log.Printf("upgrade: %s: %v", c.URL, err)
 				} else {
 					log.Printf("upgrade: requested -> %s", c.URL)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+}
+
+// fetchInfo GETs a child's /api/info and returns its reported version.
+func (s *Syncer) fetchInfo(ctx context.Context, c Child) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, childBase(c.URL)+"/api/info", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set(syncHeader, "1")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return "", fmt.Errorf("child %s /api/info HTTP %d", c.URL, resp.StatusCode)
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&body); err != nil {
+		return "", err
+	}
+	return body.Version, nil
+}
+
+// FetchVersions (center only) queries every child's /api/info and caches the
+// reported version in its ChildStatus. Called each keep-alive pass.
+func (s *Syncer) FetchVersions() {
+	if !s.syncingEnabled() {
+		return
+	}
+	children := s.store.Snapshot().Children
+	if len(children) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, c := range children {
+			c := c
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if ver, err := s.fetchInfo(ctx, c); err == nil {
+					s.recordVersion(c.URL, ver)
 				}
 			}()
 		}
@@ -367,4 +447,7 @@ func (s *Syncer) FanOutAll() {
 	// Also re-push the sync-port list each pass so children stay converged and
 	// a removed port is re-asserted as closed (full-list/declarative).
 	s.FanOutPorts()
+	// And refresh each child's reported version for the admin UI.
+	s.FetchVersions()
 }
+
