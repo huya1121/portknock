@@ -43,11 +43,12 @@ type Config struct {
 
 // Server bundles the handlers' dependencies.
 type Server struct {
-	cfg    Config
-	store  *Store
-	fw     *Firewall
-	auth   *Auth
-	syncer *Syncer
+	cfg     Config
+	store   *Store
+	fw      *Firewall
+	auth    *Auth
+	syncer  *Syncer
+	updates *UpdateChecker
 }
 
 func main() {
@@ -88,12 +89,14 @@ func main() {
 	}
 	fw := NewFirewall(cfg.DryRun)
 	syncer := NewSyncer(store)
+	updates := NewUpdateChecker()
 	srv := &Server{
-		cfg:    cfg,
-		store:  store,
-		fw:     fw,
-		auth:   NewAuth(cfg.AdminPass, 12*time.Hour),
-		syncer: syncer,
+		cfg:     cfg,
+		store:   store,
+		fw:      fw,
+		auth:    NewAuth(cfg.AdminPass, 12*time.Hour),
+		syncer:  syncer,
+		updates: updates,
 	}
 
 	// Reconcile firewall to match persisted state at startup.
@@ -107,6 +110,7 @@ func main() {
 	stop := make(chan struct{})
 	go janitor.Run(stop)
 	go syncer.RunKeepAlive(stop, cfg.Poll)
+	go updates.Run(stop) // periodically check GitHub for a newer release
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
@@ -494,6 +498,8 @@ type adminData struct {
 	APIKey      string         // JSON API bearer token ("" = API disabled)
 	APIBase     string         // base URL for API examples, e.g. http://host:8080
 	Version     string         // build version, shown in the footer
+	LatestVersion   string     // newest release tag seen on GitHub ("" = unknown)
+	UpdateAvailable bool        // a newer release is available
 }
 
 // childView is a child node plus its last-sync status, for the admin table.
@@ -653,6 +659,12 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		upgradeMsg = "✅ 已向所有子节点发送升级请求（仅对已开启“允许远程升级”的子节点生效）。"
 	}
 
+	var latestVer string
+	var updateAvail bool
+	if s.updates != nil {
+		updateAvail, latestVer = s.updates.UpdateAvailable(version)
+	}
+
 	s.render(w, "admin.html", adminData{
 		CSRF:          s.auth.CSRF(r),
 		Ports:         st.Ports,
@@ -684,6 +696,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		APIKey:      s.cfg.APIKey,
 		APIBase:     apiBase,
 		Version:     version,
+		LatestVersion:   latestVer,
+		UpdateAvailable: updateAvail,
 	})
 }
 
