@@ -379,10 +379,10 @@
       IPv6 防火墙{{if .IPv6Managed}}<span class="pill perm">受控（同 IPv4）</span>{{else}}<span class="pill world">已放开（全通）</span>{{end}}
     </h2>
     <p class="desc"><strong>受控</strong>：IPv6 和 IPv4 一样走白名单，只有开放端口/放行 IP 能通。
-      <strong>放开</strong>：ufw 不再管 IPv6，所有 IPv6 端口对全球开放、无防护。
-      切换会修改 <code>/etc/default/ufw</code> 并 reload。</p>
+      <strong>放开</strong>：放行<strong>所有</strong>入站 IPv6 流量（一条 <code>allow to ::/0</code> 规则），IPv4 仍走白名单。
+      两种模式 ufw 都继续管理 IPv6（保证能正常获取地址、NDP/RA 不被挡）。</p>
     {{if .IPv6Managed}}
-    <form method="post" action="/admin/ipv6" onsubmit="return confirm('确定放开 IPv6？\n\nufw 将不再管控 IPv6，本机所有 IPv6 端口（含 SSH、数据库等）对全球开放、无任何防护。\n\n确认继续？');">
+    <form method="post" action="/admin/ipv6" onsubmit="return confirm('确定放开 IPv6？\n\n将放行本机所有入站 IPv6 流量（含 SSH、数据库等 IPv6 端口），不再受白名单限制。IPv4 不受影响。\n\n确认继续？');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="managed" value="0">
       <button class="btn danger" type="submit">放开 IPv6（取消管控）</button>
@@ -438,8 +438,14 @@
   <div class="card" data-tab="cluster">
     <h2>
       <svg viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      版本与升级<span class="pill">当前 {{.Version}}</span>
+      版本与升级<span class="pill">当前 {{.Version}}</span>{{if .UpdateAvailable}}<span class="pill world">有新版本 {{.LatestVersion}}</span>{{end}}
     </h2>
+    {{if .UpdateAvailable}}
+    <div class="banner" style="margin:0 0 1rem;">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <div>发现新版本 <strong>{{.LatestVersion}}</strong>（当前 {{.Version}}）。点下方「升级本机」即可更新。</div>
+    </div>
+    {{end}}
     <p class="desc">升级会重新下载最新发布版本、校验后替换二进制并重启服务，期间访问会短暂中断（通常几秒）。</p>
     <form method="post" action="/admin/upgrade" onsubmit="return confirm('升级本机到最新版本？\n\n将重新下载最新 Release、校验并重启 portknock 服务，期间短暂中断。\n\n确认继续？');">
       <input type="hidden" name="csrf" value="{{.CSRF}}">

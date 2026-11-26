@@ -240,6 +240,7 @@ EOF
   seed_state
   allow_ssh
   allow_listen_port
+  allow_ipv6_essential  # keep IPv6 (SLAAC/DHCPv6/NDP) working after enabling ufw
   enable_ufw   # after the allow rules above, so enabling can't lock us out
   check_port
 
@@ -383,6 +384,49 @@ allow_listen_port() {
     say "已放行管理监听端口 ${port}/tcp（对外访问用，管理台删不掉）。"
   else
     warn "放行监听端口 ${port} 失败，请手动执行： ufw allow ${port}/tcp"
+  fi
+}
+
+# allow_ipv6_essential keeps IPv6 working after ufw is enabled. ufw's default
+# deny-inbound drops the traffic IPv6 needs to configure and keep an address:
+#   - ICMPv6 (Router Advertisement / Neighbor Discovery) — without it IPv6 is
+#     dead at the link layer (no SLAAC, no neighbor resolution). ufw can't express
+#     ICMPv6 as a port rule, so we ensure IPV6=yes (ufw's before6.rules then
+#     permits the required ICMPv6 types) and make sure IPv6 is actually managed.
+#   - Link-local fe80::/10 inbound — RA, NDP and DHCPv6 all ride on it.
+#   - DHCPv6 UDP 546 (client) + its multicast; DHCPv4 UDP 68.
+# All install-managed (portknock-install: comment) so the panel can't delete them.
+allow_ipv6_essential() {
+  command -v ufw >/dev/null 2>&1 || return
+
+  # 1) Make sure ufw manages IPv6; otherwise before6.rules (which permits the
+  #    essential ICMPv6) isn't loaded, and IPv6 breaks on enable.
+  if [ -f /etc/default/ufw ] && grep -qi '^IPV6=no' /etc/default/ufw; then
+    sed -i 's/^IPV6=no/IPV6=yes/I' /etc/default/ufw
+    say "已将 ufw 设为管理 IPv6（IPV6=yes），以放行 IPv6 必需的 ICMPv6/NDP。"
+  fi
+
+  local status; status="$(ufw status 2>/dev/null || true)"
+
+  # 2) DHCP client reply ports (v6:546 / v4:68).
+  local proto
+  for proto in 546 68; do
+    printf '%s' "$status" | grep -q "portknock-install:dhcp:${proto}\b" && continue
+    if ufw allow "${proto}/udp" comment "portknock-install:dhcp:${proto}" >/dev/null 2>&1; then
+      say "已放行 DHCP 回包端口 ${proto}/udp。"
+    else
+      warn "放行 DHCP 端口 ${proto}/udp 失败（静态 IP 可忽略）。"
+    fi
+  done
+
+  # 3) Link-local inbound (NDP / RA / DHCPv6 all use fe80::/10). ufw accepts a
+  #    from-address rule for this; harmless if IPv6 is unused.
+  if ! printf '%s' "$status" | grep -q 'portknock-install:ll6\b'; then
+    if ufw allow from fe80::/10 comment "portknock-install:ll6" >/dev/null 2>&1; then
+      say "已放行 IPv6 链路本地 fe80::/10 入站（NDP/RA/DHCPv6）。"
+    else
+      warn "放行 fe80::/10 失败（可能 ufw 未管理 IPv6）。"
+    fi
   fi
 }
 

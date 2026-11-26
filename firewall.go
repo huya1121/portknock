@@ -183,68 +183,100 @@ func (f *Firewall) IsActive() bool {
 // defaultUFWFile is where ufw keeps the IPV6=yes/no toggle.
 const defaultUFWFile = "/etc/default/ufw"
 
-// IPv6Managed reports whether ufw is configured to manage IPv6 (IPV6=yes).
-// When false, ufw ignores IPv6 entirely and all IPv6 ports are reachable.
+// ipv6AllowAllComment tags the "allow all inbound IPv6" rule that implements the
+// "IPv6 放开(全通)" mode. Its presence means IPv6 is unmanaged (全通); its
+// absence means IPv6 follows the same whitelist as IPv4.
+const ipv6AllowAllComment = "portknock:ipv6-allow-all"
+
+// IPv6Managed reports whether IPv6 follows the whitelist (true) or is fully open
+// (false). "Fully open" is implemented by an install-managed `allow to ::/0`
+// rule — NOT by IPV6=no (which merely makes ufw ignore IPv6 and, on many
+// systems, breaks IPv6 entirely because NDP/RA stop being permitted). IPV6 is
+// always kept =yes so the stack works and ufw's before6.rules permits ICMPv6.
 func (f *Firewall) IPv6Managed() bool {
 	if f.dryRun {
 		return true
 	}
-	data, err := os.ReadFile(defaultUFWFile)
+	out, err := f.run("status")
 	if err != nil {
-		return true // assume managed (ufw default) if unreadable
+		return true // assume managed if we can't tell
 	}
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-		if v, ok := strings.CutPrefix(line, "IPV6="); ok {
-			v = strings.Trim(strings.TrimSpace(v), `"'`)
-			return !strings.EqualFold(v, "no")
-		}
-	}
-	return true
+	// Managed unless the allow-all IPv6 rule is present.
+	return !strings.Contains(out, ipv6AllowAllComment)
 }
 
-// SetIPv6Managed switches ufw's IPV6 setting in /etc/default/ufw and reloads so
-// it takes effect. managed=true → IPv6 obeys the whitelist like IPv4;
-// managed=false → ufw ignores IPv6 (all IPv6 ports open). Reload re-applies the
-// current state's rules.
+// SetIPv6Managed switches how IPv6 inbound traffic is treated.
+//   - managed=true  → IPv6 follows the same whitelist as IPv4 (remove allow-all).
+//   - managed=false → IPv6 fully open: a single `allow to ::/0` rule permits ALL
+//     inbound IPv6 while IPv4 keeps its whitelist.
+//
+// Either way ufw KEEPS managing IPv6 (IPV6=yes) so the IPv6 stack works and
+// ufw's before6.rules permits the essential ICMPv6/NDP — this is the fix for
+// "enabling ufw killed IPv6": the old behaviour set IPV6=no, which broke address
+// configuration instead of opening IPv6.
 func (f *Firewall) SetIPv6Managed(managed bool, st State) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.dryRun {
-		log.Printf("[dry-run] set %s IPV6=%s + ufw reload", defaultUFWFile, boolYesNo(managed))
+		if managed {
+			log.Printf("[dry-run] ufw delete allow to ::/0 (IPv6 -> whitelist)")
+		} else {
+			log.Printf("[dry-run] ufw allow to ::/0 comment %s (IPv6 -> open)", ipv6AllowAllComment)
+		}
 		return nil
 	}
+
+	// Always ensure ufw manages IPv6; otherwise IPv6 breaks regardless of mode.
+	if err := f.ensureIPv6Yes(); err != nil {
+		log.Printf("ensure IPV6=yes: %v", err)
+	}
+
+	if managed {
+		// Remove the allow-all rule (idempotent) -> IPv6 obeys the whitelist.
+		out, err := f.run("delete", "allow", "to", "::/0")
+		if err != nil && !strings.Contains(strings.ToLower(out), "could not delete") {
+			return err
+		}
+	} else {
+		// Add the allow-all rule -> every inbound IPv6 packet is accepted.
+		if _, err := f.run("allow", "to", "::/0", "comment", ipv6AllowAllComment); err != nil {
+			return err
+		}
+	}
+	if _, err := f.run("reload"); err != nil {
+		log.Printf("ufw reload after IPv6 change: %v (applies on enable)", err)
+	}
+	return f.reconcileLocked(st)
+}
+
+// ensureIPv6Yes forces IPV6=yes in /etc/default/ufw so ufw manages IPv6 (and its
+// before6.rules permits NDP/RA). Caller holds f.mu.
+func (f *Firewall) ensureIPv6Yes() error {
 	data, err := os.ReadFile(defaultUFWFile)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", defaultUFWFile, err)
 	}
-	want := "IPV6=" + boolYesNo(managed)
 	lines := strings.Split(string(data), "\n")
-	replaced := false
+	changed, found := false, false
 	for i, line := range lines {
 		if strings.HasPrefix(strings.TrimSpace(line), "IPV6=") {
-			lines[i] = want
-			replaced = true
+			found = true
+			if strings.TrimSpace(line) != "IPV6=yes" {
+				lines[i] = "IPV6=yes"
+				changed = true
+			}
 		}
 	}
-	if !replaced {
-		lines = append(lines, want)
+	if !found {
+		lines = append(lines, "IPV6=yes")
+		changed = true
 	}
-	out := strings.Join(lines, "\n")
-	if err := os.WriteFile(defaultUFWFile, []byte(out), 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", defaultUFWFile, err)
+	if changed {
+		if err := os.WriteFile(defaultUFWFile, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", defaultUFWFile, err)
+		}
 	}
-	// Reload only matters when ufw is active; --force avoids prompts.
-	if _, err := f.run("reload"); err != nil {
-		// reload fails if ufw is inactive; not fatal — the setting is saved and
-		// applies on next enable.
-		log.Printf("ufw reload after IPv6 change: %v (saved, applies on enable)", err)
-	}
-	return f.reconcileLocked(st)
+	return nil
 }
 
 func boolYesNo(b bool) string {
