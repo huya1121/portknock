@@ -6,58 +6,133 @@ import (
 	"time"
 )
 
-// newTestSyncer builds a Syncer backed by a temp store (no network use here).
-func newTestSyncer(t *testing.T) *Syncer {
-	t.Helper()
-	st, err := NewStore(filepath.Join(t.TempDir(), "state.json"))
+func TestStoreRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewSyncer(st)
-}
-
-func TestUpstreamTTLPrune(t *testing.T) {
-	s := newTestSyncer(t)
-
-	// Fresh upstream shows up.
-	s.RecordUpstream("10.0.0.1")
-	if ups := s.Upstreams(); len(ups) != 1 {
-		t.Fatalf("expected 1 upstream, got %d", len(ups))
+	if err := s.SetPorts([]int{443, 22, 80, 80, 0, 70000}); err != nil { // dups + invalid dropped
+		t.Fatal(err)
 	}
-	if !s.hasUpstream() {
-		t.Error("hasUpstream should be true with a fresh upstream")
+	if err := s.AddFixed("203.0.113.5"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err := s.Grant("1.2.3.4", now); err != nil {
+		t.Fatal(err)
 	}
 
-	// Backdate it past the TTL -> should be pruned on next read.
-	s.mu.Lock()
-	s.upstreams["10.0.0.1"] = time.Now().Add(-upstreamTTL - time.Minute)
-	s.mu.Unlock()
-
-	if ups := s.Upstreams(); len(ups) != 0 {
-		t.Errorf("stale upstream should be pruned, got %v", ups)
+	// Reload from disk.
+	s2, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s.hasUpstream() {
-		t.Error("hasUpstream should be false after the upstream went stale")
+	st := s2.Snapshot()
+	if len(st.Ports) != 3 || st.Ports[0] != 22 || st.Ports[2] != 443 {
+		t.Errorf("ports not sorted/deduped: %v", st.Ports)
 	}
-
-	// And it should be gone from the backing map, not just the returned copy.
-	s.mu.Lock()
-	n := len(s.upstreams)
-	s.mu.Unlock()
-	if n != 0 {
-		t.Errorf("stale entry should be deleted from the map, %d remain", n)
+	if len(st.FixedIPs) != 1 || st.FixedIPs[0] != "203.0.113.5" {
+		t.Errorf("fixed ips: %v", st.FixedIPs)
+	}
+	if len(st.Dynamic) != 1 || st.Dynamic[0].IP != "1.2.3.4" {
+		t.Errorf("dynamic: %v", st.Dynamic)
 	}
 }
 
-func TestUpstreamFreshKept(t *testing.T) {
-	s := newTestSyncer(t)
-	s.RecordUpstream("10.0.0.2")
-	// Backdate but still within TTL.
-	s.mu.Lock()
-	s.upstreams["10.0.0.2"] = time.Now().Add(-upstreamTTL + 5*time.Minute)
-	s.mu.Unlock()
-	if ups := s.Upstreams(); len(ups) != 1 {
-		t.Errorf("upstream within TTL should be kept, got %v", ups)
+func TestTouchAndExpire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := NewStore(path)
+	base := time.Now()
+	// Two dynamic IPs granted now.
+	s.Grant("1.1.1.1", base)
+	s.Grant("2.2.2.2", base)
+
+	window := 48 * time.Hour
+	// 49h later: 1.1.1.1 is active (touched), 2.2.2.2 idle -> expires.
+	later := base.Add(49 * time.Hour)
+	expired, err := s.TouchAndExpire(map[string]bool{"1.1.1.1": true}, window, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 || expired[0] != "2.2.2.2" {
+		t.Fatalf("expected 2.2.2.2 expired, got %v", expired)
+	}
+	st := s.Snapshot()
+	if len(st.Dynamic) != 1 || st.Dynamic[0].IP != "1.1.1.1" {
+		t.Fatalf("expected only 1.1.1.1 to remain, got %v", st.Dynamic)
+	}
+	if !st.Dynamic[0].LastSeen.Equal(later) {
+		t.Errorf("1.1.1.1 LastSeen not refreshed: %v", st.Dynamic[0].LastSeen)
+	}
+}
+
+func TestRevokeDynamicIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := NewStore(path)
+	s.Grant("1.1.1.1", time.Now())
+	if err := s.RevokeDynamic("1.1.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeDynamic("1.1.1.1"); err != nil { // second time: no-op
+		t.Fatal(err)
+	}
+	if len(s.Snapshot().Dynamic) != 0 {
+		t.Error("expected empty dynamic list")
+	}
+}
+
+func TestSyncInterval(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, _ := NewStore(path)
+	def := 2 * time.Minute
+
+	// Unset -> falls back to default.
+	if got := s.SyncIntervalOr(def); got != def {
+		t.Errorf("unset: got %v, want %v", got, def)
+	}
+
+	// Normal value round-trips (and survives reload).
+	if err := s.SetSyncInterval(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SyncIntervalOr(def); got != 30*time.Second {
+		t.Errorf("set 30s: got %v", got)
+	}
+	s2, _ := NewStore(path)
+	if got := s2.SyncIntervalOr(def); got != 30*time.Second {
+		t.Errorf("after reload: got %v", got)
+	}
+
+	// Below the 10s floor is clamped up, both on write and on read.
+	if err := s.SetSyncInterval(3 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SyncIntervalOr(def); got != minSyncInterval {
+		t.Errorf("clamp 3s: got %v, want %v", got, minSyncInterval)
+	}
+}
+
+func TestNodeModeCenterAdoptsReceived(t *testing.T) {
+	s, _ := NewStore(filepath.Join(t.TempDir(), "state.json"))
+	_ = s.SetPorts([]int{80})
+	_ = s.AddFixed("203.0.113.1")
+	_ = s.SetReceivedPorts([]int{80, 9000})          // 80 overlaps local
+	_ = s.SetReceivedFixedIPs([]string{"203.0.113.1", "203.0.113.9"}) // .1 overlaps
+
+	if err := s.SetNodeMode("center"); err != nil {
+		t.Fatal(err)
+	}
+	st := s.Snapshot()
+	// Received lists are emptied; their contents merged into local (deduped).
+	if len(st.ReceivedPorts) != 0 || len(st.ReceivedFixedIPs) != 0 {
+		t.Errorf("received lists should be cleared: ports=%v fixed=%v", st.ReceivedPorts, st.ReceivedFixedIPs)
+	}
+	if got := st.Ports; len(got) != 2 || got[0] != 80 || got[1] != 9000 {
+		t.Errorf("ports should adopt 9000 (deduped): got %v", got)
+	}
+	if len(st.FixedIPs) != 2 {
+		t.Errorf("fixed IPs should adopt .9 (deduped from 3->2): got %v", st.FixedIPs)
 	}
 }
 
