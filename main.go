@@ -388,6 +388,12 @@ func (s *Server) handleAPIPorts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
 		return
 	}
+	// A forced-center node is nobody's downstream: refuse config pushes so an
+	// upstream can't keep re-populating ports we just cleared on the mode switch.
+	if s.store.Snapshot().NodeMode == "center" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node is a forced center"})
+		return
+	}
 	var body struct {
 		Ports []int `json:"ports"`
 	}
@@ -427,6 +433,10 @@ func (s *Server) handleAPIFixed(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Header.Get(syncHeader) == "" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync endpoint"})
+		return
+	}
+	if s.store.Snapshot().NodeMode == "center" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node is a forced center"})
 		return
 	}
 	var body struct {
@@ -913,6 +923,15 @@ func (s *Server) handleNodeMode(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.SetNodeMode(mode); err != nil {
 		http.Error(w, "无效的节点模式", http.StatusBadRequest)
 		return
+	}
+	// Switching to a forced center drops any upstream-pushed ports/fixed IPs
+	// (done in the store); reconcile ufw so they're actually removed, and clear
+	// the recorded upstreams so the UI no longer shows a stale "⬆ 上游主节点".
+	if mode == "center" && s.syncer != nil {
+		s.syncer.ClearUpstreams()
+	}
+	if err := s.fw.ReconcileAll(s.store.Snapshot()); err != nil {
+		log.Printf("reconcile after node-mode change: %v", err)
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }

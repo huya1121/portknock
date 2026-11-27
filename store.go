@@ -262,6 +262,35 @@ func (s *Store) SetNodeMode(mode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.NodeMode = mode
+	// A forced center is nobody's downstream. Rather than drop what an upstream
+	// pushed while we were a child (which would delete live ufw rules and could
+	// cut access), ADOPT it as our own config: merge received sync-ports into the
+	// local open ports, received fixed IPs into the local fixed IPs, then clear
+	// the received lists. The firewall rules stay in place seamlessly; they're
+	// just owned by us now and no longer shown as "来自上游". (handleNodeMode
+	// reconciles ufw after this — a no-op for the already-present rules.)
+	if mode == "center" {
+		if len(s.state.ReceivedPorts) > 0 {
+			s.state.Ports = cleanPorts(append(s.state.Ports, s.state.ReceivedPorts...))
+			s.state.ReceivedPorts = []int{}
+		}
+		if len(s.state.ReceivedFixedIPs) > 0 {
+			merged := append([]string(nil), s.state.FixedIPs...)
+			merged = append(merged, s.state.ReceivedFixedIPs...)
+			seen := map[string]bool{}
+			out := merged[:0]
+			for _, ip := range merged {
+				if ip == "" || seen[ip] {
+					continue
+				}
+				seen[ip] = true
+				out = append(out, ip)
+			}
+			sort.Strings(out)
+			s.state.FixedIPs = out
+			s.state.ReceivedFixedIPs = []string{}
+		}
+	}
 	return s.persistLocked()
 }
 

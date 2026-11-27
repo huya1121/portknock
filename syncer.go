@@ -92,16 +92,34 @@ func (s *Syncer) RecordUpstream(ip string) {
 	s.upstreams[ip] = time.Now()
 }
 
+// upstreamTTL is how long an upstream center is remembered without a new push.
+// After this, it's considered gone and dropped from the list.
+const upstreamTTL = time.Hour
+
 // Upstreams returns a copy of the upstream centers (IP -> last push time) that
-// have synced grants to this node.
+// have synced grants to this node. Entries not refreshed within upstreamTTL are
+// pruned (an upstream that stopped pushing for an hour is treated as gone).
 func (s *Syncer) Upstreams() map[string]time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	out := make(map[string]time.Time, len(s.upstreams))
 	for k, v := range s.upstreams {
+		if now.Sub(v) > upstreamTTL {
+			delete(s.upstreams, k) // stale: forget it
+			continue
+		}
 		out[k] = v
 	}
 	return out
+}
+
+// ClearUpstreams forgets all recorded upstream centers (used when switching to
+// a forced-center role, where this node is no longer anyone's downstream).
+func (s *Syncer) ClearUpstreams() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.upstreams = map[string]time.Time{}
 }
 
 // record stores the outcome of a push to url, preserving any known Version.
@@ -301,7 +319,15 @@ func (s *Syncer) RunKeepAlive(stop <-chan struct{}, defInterval time.Duration) {
 func (s *Syncer) hasUpstream() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.upstreams) > 0
+	now := time.Now()
+	for k, v := range s.upstreams {
+		if now.Sub(v) > upstreamTTL {
+			delete(s.upstreams, k) // stale: forget it
+			continue
+		}
+		return true // at least one fresh upstream
+	}
+	return false
 }
 
 // EffectiveMode resolves the node's role, combining the admin's explicit override
